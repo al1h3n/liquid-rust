@@ -1,0 +1,5 @@
+target/
+web/pkg/
+web/background.*
+*.png
+!docs/*.png

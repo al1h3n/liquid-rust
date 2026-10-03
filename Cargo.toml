@@ -1,0 +1,31 @@
+[package]
+name = "liquid-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Apple-style Liquid Glass for wgpu: SDF glass groups, refraction, frost, rim light, analytic springs. Native and WebGPU."
+license = "MIT OR Apache-2.0"
+keywords = ["liquid-glass", "wgpu", "webgpu", "ui", "glassmorphism"]
+categories = ["graphics", "gui", "rendering"]
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.33", features = ["bytemuck"] }
+slotmap = "1"
+wgpu = { version = "30", default-features = false, features = ["wgsl"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+pollster = "1"
+wgpu = "30"
+winit = "0.30"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace]
+members = [".", "web"]

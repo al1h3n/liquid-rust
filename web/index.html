@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquid Rust — WebGPU</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font: 14px system-ui, sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; touch-action: none; }
+  #hint { position: fixed; left: 16px; bottom: 12px; opacity: .7; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="glass"></canvas>
+<div id="hint">Drag the lens · press controls · 1/2/3 transparency · D dark · C contrast · R reduce transparency · M reduce motion · L light</div>
+<script type="module">
+import init, { LiquidGlass } from "./pkg/liquid_rust_web.js";
+
+const hint = document.getElementById("hint");
+if (!navigator.gpu) hint.textContent = "WebGPU is not available in this browser.";
+await init();
+const canvas = document.getElementById("glass");
+const dpr = devicePixelRatio;
+canvas.width = Math.round(innerWidth * dpr);
+canvas.height = Math.round(innerHeight * dpr);
+
+const url = new URLSearchParams(location.search).get("bg") ?? "background.png";
+const blob = await (await fetch(url)).blob();
+const bitmap = await createImageBitmap(blob, { resizeWidth: canvas.width, resizeHeight: canvas.height, resizeQuality: "high" });
+const glass = await LiquidGlass.create(canvas, bitmap, dpr);
+
+const W = innerWidth, H = innerHeight;
+const bar = glass.addContainer(14, 0);
+for (let i = 0; i < 3; i++) glass.add(24 + i * 60, 24, 52, 52, -1, "regular", 0, true, false, bar, 0);
+glass.add(W - 134, 24, 110, 52, -1, "tinted", 0x0088ff, true, false, -1, 0);
+const liquid = glass.addContainer(28, 0);
+glass.add(80, 200, 140, 140, -1, "clear", 0, false, false, liquid, 0);
+glass.add(236, 240, 96, 96, -1, "clear", 0, false, false, liquid, 0);
+glass.add(120, 400, 96, 96, -1, "clear", 0, false, true, liquid, 0);
+glass.add(W / 2 - 190, H - 96, 380, 64, -1, "regular", 0, false, false, -1, 0);
+
+// Render on demand: run rAF only while the engine reports motion.
+let running = false, last = performance.now();
+const tick = (now) => {
+  const dt = (now - last) / 1000;
+  last = now;
+  running = glass.frame(dt);
+  if (running) requestAnimationFrame(tick);
+};
+const wake = () => {
+  if (running) return;
+  running = true;
+  last = performance.now();
+  requestAnimationFrame(tick);
+};
+wake();
+
+canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); glass.pointerDown(e.clientX, e.clientY); wake(); });
+canvas.addEventListener("pointermove", (e) => { glass.pointerMove(e.clientX, e.clientY); wake(); });
+canvas.addEventListener("pointerup", () => { glass.pointerUp(); wake(); });
+
+const state = {
+  t: matchMedia("(prefers-reduced-transparency: reduce)").matches ? 1 : 0.5,
+  dark: matchMedia("(prefers-color-scheme: dark)").matches,
+  rt: false,
+  ic: matchMedia("(prefers-contrast: more)").matches,
+  rm: matchMedia("(prefers-reduced-motion: reduce)").matches,
+  light: 0,
+};
+const apply = () => { glass.setAppearance(state.t, state.dark, state.rt, state.ic, state.rm); wake(); };
+apply();
+addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (k === "1") state.t = 0; else if (k === "2") state.t = 0.5; else if (k === "3") state.t = 1;
+  else if (k === "d") state.dark = !state.dark; else if (k === "c") state.ic = !state.ic;
+  else if (k === "r") state.rt = !state.rt; else if (k === "m") state.rm = !state.rm;
+  else if (k === "l") { state.light += 90; glass.setLightAngle(state.light); }
+  apply();
+});
+</script>
+</body>
+</html>
