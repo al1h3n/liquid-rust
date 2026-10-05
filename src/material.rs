@@ -260,6 +260,11 @@ pub(crate) struct Resolved {
     pub contrast: f32,
 }
 
+/// How "thick" adaptive glass is, `0..=1`, from its smaller side in points.
+pub(crate) fn thickness(min_side: f32) -> f32 {
+    smoothstep(44.0, 320.0, min_side)
+}
+
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -277,7 +282,7 @@ impl Material {
         if m.adaptive {
             // Apple: larger glass is "thicker" — deeper shadow, more lensing, softer
             // scattering, more opaque — and stops flipping light/dark.
-            let tau = smoothstep(44.0, 320.0, min_side);
+            let tau = thickness(min_side);
             m.frost *= 1.0 + 0.6 * tau;
             m.depth *= 1.0 + 0.25 * tau;
             m.specular -= 0.05 * tau;

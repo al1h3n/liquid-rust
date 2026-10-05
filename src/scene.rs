@@ -88,7 +88,10 @@ pub fn smooth_corner(radius: f32, smoothing: f32, budget: f32) -> (f32, f32) {
 /// Groups glass that renders together and liquid-merges, like `GlassEffectContainer`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Container {
-    /// Distance in points at which member shapes start to blend together.
+    /// Distance in points at which member shapes start to bend toward each other. They
+    /// join with a liquid neck below half of it. Rest them either under half (joined) or
+    /// at least this far apart (clean): in between they stay bent without touching, and a
+    /// neck that breaks just before they stop looks like a glitch.
     pub spacing: f32,
     /// Stacking order. Higher containers sample the rendered glass below them.
     pub z: i32,
@@ -256,6 +259,10 @@ pub struct Scene {
     pub(crate) containers: SlotMap<ContainerId, Container>,
     /// Colour scheme, transparency slider and accessibility settings.
     pub appearance: Appearance,
+    /// `false` turns every spring off: frames, materialize, press and lens motion land
+    /// instantly, and press growth, lens lift and stretch are skipped. Liquid merging is
+    /// geometry, not physics; control it with container spacing.
+    pub physics: bool,
     pub(crate) light_angle: Animated,
     pub(crate) touch: Touch,
     pressed: Option<GlassId>,
@@ -276,6 +283,7 @@ impl Scene {
             nodes: SlotMap::with_key(),
             containers: SlotMap::with_key(),
             appearance: Appearance::default(),
+            physics: true,
             light_angle: Animated::new(0.0, LIGHT_SWEEP),
             touch: Touch {
                 pos: Vec2::ZERO,
@@ -292,9 +300,22 @@ impl Scene {
         if self.appearance.reduce_motion { spring.without_bounce() } else { spring }
     }
 
+    /// No decorative motion: Reduce Motion or physics off.
+    fn still(&self) -> bool {
+        self.appearance.reduce_motion || !self.physics
+    }
+
     /// Adds a container (`GlassEffectContainer(spacing:)`).
     pub fn add_container(&mut self, spacing: f32, z: i32) -> ContainerId {
         self.containers.insert(Container { spacing, z })
+    }
+
+    /// Changes a container's [`Container::spacing`] (points). `0` turns liquid merging
+    /// off for that container.
+    pub fn set_container_spacing(&mut self, id: ContainerId, spacing: f32) {
+        if let Some(container) = self.containers.get_mut(id) {
+            container.spacing = spacing.max(0.0);
+        }
     }
 
     /// Adds glass; it materializes by ramping its lensing in.
@@ -332,6 +353,48 @@ impl Scene {
     /// Description of a glass element (its target frame, not the animated one).
     pub fn glass(&self, id: GlassId) -> Option<&Glass> {
         self.nodes.get(id).map(|n| &n.glass)
+    }
+
+    /// Frame on screen right now, mid-animation (without press or lens scaling).
+    pub fn current_frame(&self, id: GlassId) -> Option<Rect> {
+        self.nodes.get(id).map(|n| Rect::new(n.x.value, n.y.value, n.w.value, n.h.value))
+    }
+
+    /// Grows new glass out of `source`: it starts at `source`'s current frame and springs
+    /// to `glass.frame`, like a search bar opening into its results. Without a container
+    /// of its own, `glass` joins `source`'s; sharing a container, it emerges fused to
+    /// `source`, stretches a liquid neck and pinches off once the gap passes half the
+    /// container's spacing; end at least the full spacing away for clean shapes (see
+    /// [`Container::spacing`]). Outside a container it materializes instead.
+    pub fn expand_from(&mut self, source: GlassId, mut glass: Glass, spring: Spring) -> GlassId {
+        let Some(start) = self.current_frame(source) else { return self.add(glass) };
+        glass.container = glass.container.or(self.nodes[source].glass.container);
+        let fused = self.fuses(source, glass.container);
+        let target = glass.frame;
+        let id = self.add(Glass { frame: start, ..glass });
+        if fused {
+            self.nodes[id].presence.snap(1.0);
+        }
+        self.set_frame_with(id, target, spring);
+        id
+    }
+
+    /// Reverse of [`Scene::expand_from`]: springs `id` back into `target`'s frame. Fused
+    /// glass is dropped once it has merged back in; otherwise it dematerializes.
+    pub fn collapse_into(&mut self, id: GlassId, target: GlassId, spring: Spring) {
+        let Some(frame) = self.glass(target).map(|g| g.frame) else { return self.remove(id) };
+        self.set_frame_with(id, frame, spring);
+        let container = self.glass(id).and_then(|g| g.container);
+        if self.fuses(target, container) {
+            self.nodes[id].removing = true;
+        } else {
+            self.remove(id);
+        }
+    }
+
+    /// `true` when glass in `container` liquid-merges with `other`.
+    fn fuses(&self, other: GlassId, container: Option<ContainerId>) -> bool {
+        container.is_some_and(|c| self.glass(other).is_some_and(|g| g.container == Some(c)) && self.containers[c].spacing > 0.0)
     }
 
     /// Moves/resizes with the default morph spring (`.snappy`).
@@ -385,7 +448,7 @@ impl Scene {
     /// Press at `p` (points). Returns the glass that took the press.
     pub fn pointer_down(&mut self, p: Vec2) -> Option<GlassId> {
         let id = self.hit_test(p)?;
-        let reduce_motion = self.appearance.reduce_motion;
+        let still = self.still();
         let lift = self.spring(LIFT);
         let node = &mut self.nodes[id];
         let size = Vec2::new(node.w.target, node.h.target);
@@ -393,7 +456,7 @@ impl Scene {
             node.press.animate_to(1.0, PRESS_DOWN);
         }
         if node.glass.lens {
-            if !reduce_motion {
+            if !still {
                 node.lift.animate_to(1.0, lift);
             }
             let center = Vec2::new(node.x.target, node.y.target) + size * 0.5;
@@ -442,6 +505,10 @@ impl Scene {
     /// Advances all animation by `dt` seconds. Returns `true` while anything moves;
     /// when `false`, stop requesting frames until the next input or change.
     pub fn update(&mut self, dt: f32) -> bool {
+        if !self.physics {
+            self.settle();
+            return false;
+        }
         let dt = dt.clamp(0.0, 1.0 / 30.0);
         self.update_drag_stretch(dt);
 
@@ -463,12 +530,26 @@ impl Scene {
         moving |= self.touch.intensity.step(dt);
         moving |= self.touch.radius.step(dt);
         moving |= self.light_angle.step(dt);
-        self.nodes.retain(|_, n| !(n.removing && n.presence.is_at_rest()));
+        self.nodes.retain(|_, n| !(n.removing && [&n.presence, &n.x, &n.y, &n.w, &n.h].iter().all(|a| a.is_at_rest())));
         moving || self.drag.as_ref().is_some_and(|d| d.velocity != Vec2::ZERO)
     }
 
+    /// Physics off: jumps every animation to its target.
+    fn settle(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.stretch.target = 0.0;
+            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch] {
+                a.snap(a.target);
+            }
+        }
+        for a in [&mut self.touch.intensity, &mut self.touch.radius, &mut self.light_angle] {
+            a.snap(a.target);
+        }
+        self.nodes.retain(|_, n| !n.removing);
+    }
+
     fn update_drag_stretch(&mut self, dt: f32) {
-        let reduce_motion = self.appearance.reduce_motion;
+        let still = self.still();
         let Some(drag) = &mut self.drag else { return };
         if dt > 0.0 {
             let v = drag.moved / dt;
@@ -483,7 +564,7 @@ impl Scene {
         if speed > 1.0 {
             node.stretch_dir = drag.velocity / speed;
         }
-        let target = if reduce_motion { 0.0 } else { (speed / STRETCH_SPEED).min(1.0) * MAX_STRETCH };
+        let target = if still { 0.0 } else { (speed / STRETCH_SPEED).min(1.0) * MAX_STRETCH };
         node.stretch.animate_to(target, JELLY);
     }
 
@@ -493,7 +574,7 @@ impl Scene {
 
     pub(crate) fn geometry(&self, node: &Node) -> Geometry {
         let size = Vec2::new(node.w.value.max(0.0), node.h.value.max(0.0));
-        let grow = if self.appearance.reduce_motion { 0.0 } else { (10.0 / size.min_element().max(1.0)).min(0.15) };
+        let grow = if self.still() { 0.0 } else { (10.0 / size.min_element().max(1.0)).min(0.15) };
         let scale = 1.0 + node.press.value * grow + node.lift.value * LENS_LIFT;
         let half = size * 0.5 * scale;
         let budget = half.min_element();
@@ -595,6 +676,37 @@ mod tests {
             scene.update(1.0 / 120.0);
         }
         assert!(scene.nodes[id].stretch.value > 0.1);
+    }
+
+    #[test]
+    fn physics_off_lands_frames_instantly() {
+        let mut scene = Scene::new();
+        scene.physics = false;
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)));
+        scene.set_frame(id, Rect::new(100.0, 0.0, 80.0, 40.0));
+        assert!(!scene.update(1.0 / 120.0));
+        assert_eq!(scene.current_frame(id), Some(Rect::new(100.0, 0.0, 80.0, 40.0)));
+        assert_eq!(scene.nodes[id].presence.value, 1.0);
+        scene.remove(id);
+        scene.update(1.0 / 120.0);
+        assert!(scene.glass(id).is_none());
+    }
+
+    #[test]
+    fn expand_starts_at_source_and_collapses_back() {
+        let mut scene = Scene::new();
+        let c = scene.add_container(20.0, 0);
+        let bar = scene.add(Glass::new(Rect::new(10.0, 10.0, 200.0, 44.0)).container(c));
+        settle(&mut scene);
+        let panel = scene.expand_from(bar, Glass::new(Rect::new(10.0, 70.0, 200.0, 300.0)), Spring::SNAPPY);
+        assert_eq!(scene.current_frame(panel), Some(Rect::new(10.0, 10.0, 200.0, 44.0)));
+        assert_eq!(scene.glass(panel).map(|g| g.container), Some(Some(c)));
+        assert_eq!(scene.nodes[panel].presence.value, 1.0, "emerges fused, not materializing");
+        settle(&mut scene);
+        assert!((scene.nodes[panel].h.value - 300.0).abs() < 0.01);
+        scene.collapse_into(panel, bar, Spring::SNAPPY);
+        settle(&mut scene);
+        assert!(scene.glass(panel).is_none());
     }
 
     #[test]

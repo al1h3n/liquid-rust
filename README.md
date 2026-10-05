@@ -60,6 +60,34 @@ renderer.render(&device, &queue, &mut encoder, &Frame {
 Input: `scene.pointer_down(p)`, `pointer_move(p)`, `pointer_up()` (points).
 Animate layout with `scene.set_frame(id, rect)`. Use `scene.remove(id)` to dematerialize glass.
 
+### Merging, physics and morphs
+
+- **Merge distance.** The first argument of `add_container(spacing, z)` is the distance in points
+  at which shapes start to bend toward each other. Below half of it they join with a liquid
+  neck. Change it later with `scene.set_container_spacing(id, pt)`. Use `0`, or leave the glass
+  out of any container, for no merging at all. Rest shapes either under half the spacing
+  (joined) or at least the full spacing apart (clean). In between they stay bent toward each
+  other without touching, and a neck that breaks just as they stop looks like a glitch,
+  especially with Reduce Motion, which has no overshoot to carry them past it.
+- **Physics off.** `scene.physics = false` makes every change land on the next `update`: no
+  springs, press growth, lens lift or stretch. Use it for static UI, tests or layout work.
+  `appearance.reduce_motion` is the gentler option: it keeps the motion and drops the bounce.
+- **Grow one glass out of another.** For example, a search bar opening into its results:
+
+```rust
+let search = scene.add_container(16.0, 1);
+let bar = scene.add(Glass::new(Rect::new(40.0, 24.0, 320.0, 52.0)).interactive().container(search));
+// on click:
+let results = scene.expand_from(bar, Glass::new(Rect::new(40.0, 96.0, 320.0, 400.0)).shape(Shape::Rounded(28.0)), Spring::new(0.5, 0.2));
+// to close:
+scene.collapse_into(results, bar, Spring::new(0.35, 0.0));
+```
+
+  The new glass starts at the bar's current frame, fused with it. It stretches a liquid neck
+  while it grows and pinches off once the gap passes half the spacing. Here the gap ends at
+  20 pt, past the 16 pt spacing, so both shapes settle clean. For the two to stay joined, end
+  the gap under half the spacing instead.
+
 ## Contract
 
 - `content` and `target` are different textures of the same size. `content` must be
@@ -90,7 +118,8 @@ cargo run --release --example demo -- path/to/wallpaper.jpg
 ```
 
 In the demo, drag the lens: it fuses with the blobs. Click `…` or press Space to morph a button into a
-menu. Keys: `1` `2` `3` for the transparency slider, `D` for the dark scheme, `R` / `C` / `M` for
+menu. Click the search bar or press `F` to open its results, and `Esc` to close them. `P` turns
+physics on and off, and `[` / `]` change the blobs' merge distance. Other keys: `1` `2` `3` for the transparency slider, `D` for the dark scheme, `R` / `C` / `M` for
 the accessibility settings, `L` to sweep the light, `S` to scroll content under the glass.
 
 ```bash
@@ -98,7 +127,8 @@ cargo run --release --example snapshot -- wallpaper.png out.png home
 ```
 
 The snapshot example renders headless. Modes: `lock`, `home` (Apple kit positions),
-`corners` (circular vs iOS vs 100 % smoothing), `showcase`, `press`, `bench`.
+`corners` (circular vs iOS vs 100 % smoothing), `showcase`, `press`, `search` (results panel
+mid-way out of a search bar), `bench`.
 
 ### Web (WebGPU)
 
@@ -109,8 +139,9 @@ python -m http.server
 ```
 
 Then open `http://localhost:8000/index.html?bg=your-image.png`. `web/src/lib.rs` is a thin
-`wasm-bindgen` wrapper with the methods `create`, `add`, `addContainer`, `setFrame`, `remove`,
-`pointerDown`/`Move`/`Up`, `setAppearance`, `setLightAngle` and `frame(dt) -> animating`.
+`wasm-bindgen` wrapper with the methods `create`, `add`, `addContainer`, `setContainerSpacing`,
+`setFrame`, `remove`, `expandFrom`, `collapseInto`, `setPhysics`, `pointerDown`/`Move`/`Up`,
+`setAppearance`, `setLightAngle` and `frame(dt) -> animating`.
 
 ## Performance
 

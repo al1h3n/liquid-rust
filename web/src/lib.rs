@@ -1,7 +1,7 @@
 //! Liquid Rust in the browser: WebGPU through wgpu, driven from JavaScript.
 #![cfg(target_arch = "wasm32")]
 
-use liquid_rust::{Color, ContainerId, Frame, Glass, GlassId, Material, Rect, Renderer, Scene, Shape, Vec2};
+use liquid_rust::{Color, ContainerId, Frame, Glass, GlassId, Material, Rect, Renderer, Scene, Shape, Spring, Vec2};
 use wasm_bindgen::prelude::*;
 
 /// Glass rendered over an image on a `<canvas>`.
@@ -90,20 +90,25 @@ impl LiquidGlass {
         self.containers.len() as u32 - 1
     }
 
+    /// Merge distance of a container in CSS pixels; 0 turns liquid merging off.
+    #[wasm_bindgen(js_name = setContainerSpacing)]
+    pub fn set_container_spacing(&mut self, container: u32, spacing: f32) {
+        if let Some(&c) = self.containers.get(container as usize) {
+            self.scene.set_container_spacing(c, spacing);
+        }
+    }
+
+    /// `false` makes every change land instantly (no springs, stretch or lift).
+    #[wasm_bindgen(js_name = setPhysics)]
+    pub fn set_physics(&mut self, on: bool) {
+        self.scene.physics = on;
+    }
+
     /// Adds glass in CSS pixels. `material`: "regular", "clear", "clear-bar" or "tinted"
     /// (with `tint` as 0xRRGGBB). `radius < 0` makes a capsule; `container < 0` means none.
     #[expect(clippy::too_many_arguments, reason = "flat JS binding")]
     pub fn add(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, material: &str, tint: u32, interactive: bool, lens: bool, container: i32, z: i32) -> u32 {
-        let material = match material {
-            "clear" => Material::clear(),
-            "clear-bar" => Material::clear_bar(),
-            "tinted" => Material::tinted(Color::hex(tint)),
-            _ => Material::regular(),
-        };
-        let mut glass = Glass::new(Rect::new(x, y, w, h)).material(material).z(z);
-        if radius >= 0.0 {
-            glass = glass.shape(Shape::Rounded(radius));
-        }
+        let mut glass = base_glass(x, y, w, h, radius, material, tint).z(z);
         if interactive {
             glass = glass.interactive();
         }
@@ -115,6 +120,28 @@ impl LiquidGlass {
         }
         self.glass.push(self.scene.add(glass));
         self.glass.len() as u32 - 1
+    }
+
+    /// Grows new glass (CSS pixels) out of glass `source`, in `source`'s container; see
+    /// [`Scene::expand_from`]. Returns its handle.
+    #[wasm_bindgen(js_name = expandFrom)]
+    #[expect(clippy::too_many_arguments, reason = "flat JS binding")]
+    pub fn expand_from(&mut self, source: u32, x: f32, y: f32, w: f32, h: f32, radius: f32, material: &str, tint: u32) -> u32 {
+        let glass = base_glass(x, y, w, h, radius, material, tint);
+        let id = match self.glass.get(source as usize) {
+            Some(&from) => self.scene.expand_from(from, glass, Spring::new(0.5, 0.2)),
+            None => self.scene.add(glass),
+        };
+        self.glass.push(id);
+        self.glass.len() as u32 - 1
+    }
+
+    /// Shrinks glass `id` back into glass `target` and dematerializes it.
+    #[wasm_bindgen(js_name = collapseInto)]
+    pub fn collapse_into(&mut self, id: u32, target: u32) {
+        if let (Some(&id), Some(&target)) = (self.glass.get(id as usize), self.glass.get(target as usize)) {
+            self.scene.collapse_into(id, target, Spring::new(0.35, 0.0));
+        }
     }
 
     /// Morphs glass `id` to a new frame (CSS pixels).
@@ -192,4 +219,15 @@ impl LiquidGlass {
         self.content_changed = false;
         animating
     }
+}
+
+fn base_glass(x: f32, y: f32, w: f32, h: f32, radius: f32, material: &str, tint: u32) -> Glass {
+    let material = match material {
+        "clear" => Material::clear(),
+        "clear-bar" => Material::clear_bar(),
+        "tinted" => Material::tinted(Color::hex(tint)),
+        _ => Material::regular(),
+    };
+    let glass = Glass::new(Rect::new(x, y, w, h)).material(material);
+    if radius >= 0.0 { glass.shape(Shape::Rounded(radius)) } else { glass }
 }

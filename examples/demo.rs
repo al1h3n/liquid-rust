@@ -4,9 +4,10 @@
 //! cargo run --release --example demo -- [background.jpg]
 //! ```
 //! Drag the clear lens (it fuses with the blobs), press any control, click `…` to morph
-//! it into a menu. Keys: `1` `2` `3` transparency slider (ultra clear, default, fully
-//! tinted), `D` dark scheme, `R` Reduce Transparency, `C` Increase Contrast, `M` Reduce
-//! Motion, `L` sweep the light, `S` scroll the content under the glass.
+//! it into a menu, click the search bar (or press `F`) to open its results. Keys: `1` `2`
+//! `3` transparency slider (ultra clear, default, fully tinted), `D` dark scheme, `R`
+//! Reduce Transparency, `C` Increase Contrast, `M` Reduce Motion, `P` physics on/off,
+//! `[` `]` merge distance of the blobs, `L` sweep the light, `S` scroll the content.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,9 +37,11 @@ struct U { offset: vec4f };
 ";
 
 struct Ui {
-    menu_container: ContainerId,
+    liquid: ContainerId,
     more: GlassId,
     menu: Option<GlassId>,
+    search: GlassId,
+    results: Option<GlassId>,
     pressed: Option<(GlassId, Vec2)>,
 }
 
@@ -66,6 +69,7 @@ struct App {
     scrolling: bool,
     scroll: f32,
     light: f32,
+    spacing: f32,
     content_dirty: bool,
     frames: u32,
     fps_clock: Instant,
@@ -79,6 +83,9 @@ fn build_scene(scene: &mut Scene, size: Vec2) -> Ui {
     let menu_container = scene.add_container(20.0, 2);
     let more = scene.add(Glass::new(Rect::new(220.0, 24.0, 52.0, 52.0)).interactive().container(menu_container));
     scene.add(Glass::new(Rect::new(size.x - 134.0, 24.0, 110.0, 52.0)).material(Material::tinted(Color::BLUE)).interactive());
+
+    let search_container = scene.add_container(16.0, 2);
+    let search = scene.add(Glass::new(Rect::new(490.0, 24.0, 250.0, 52.0)).interactive().container(search_container));
 
     let liquid = scene.add_container(28.0, 0);
     scene.add(Glass::new(Rect::new(80.0, 220.0, 140.0, 140.0)).material(Material::clear()).container(liquid));
@@ -97,7 +104,7 @@ fn build_scene(scene: &mut Scene, size: Vec2) -> Ui {
     let tab_bar = Rect::new(size.x * 0.5 - 190.0, size.y - 96.0, 380.0, 64.0);
     scene.add(Glass::new(tab_bar).shape(Shape::Capsule));
     scene.add(Glass::new(Rect::new(tab_bar.x + 6.0, tab_bar.y + 6.0, 92.0, 52.0)).material(Material::clear()).lens().z(1));
-    Ui { menu_container, more, menu: None, pressed: None }
+    Ui { liquid, more, menu: None, search, results: None, pressed: None }
 }
 
 impl App {
@@ -105,16 +112,33 @@ impl App {
         let Some(ui) = &mut self.ui else { return };
         let button = self.scene.glass(ui.more).map_or(Rect::default(), |g| g.frame);
         match ui.menu.take() {
-            Some(menu) => {
-                self.scene.set_frame_with(menu, button, Spring::new(0.4, 0.0));
-                self.scene.remove(menu);
-            }
+            Some(menu) => self.scene.collapse_into(menu, ui.more, Spring::new(0.4, 0.0)),
             None => {
-                let menu = self.scene.add(Glass::new(button).shape(Shape::Rounded(26.0)).container(ui.menu_container));
-                self.scene.set_frame_with(menu, Rect::new(button.x, button.y + 64.0, 250.0, 300.0), Spring::new(0.45, 0.25));
-                ui.menu = Some(menu);
+                let menu = Glass::new(Rect::new(button.x, button.y + button.height + 24.0, 250.0, 300.0)).shape(Shape::Rounded(26.0));
+                ui.menu = Some(self.scene.expand_from(ui.more, menu, Spring::new(0.45, 0.25)));
             }
         }
+    }
+
+    /// The results panel grows out of the search bar, stays joined by a liquid neck while
+    /// close, and pinches off once the gap passes the container's 16 pt spacing.
+    fn toggle_search(&mut self) {
+        let Some(ui) = &mut self.ui else { return };
+        let bar = self.scene.glass(ui.search).map_or(Rect::default(), |g| g.frame);
+        match ui.results.take() {
+            Some(results) => self.scene.collapse_into(results, ui.search, Spring::new(0.35, 0.0)),
+            None => {
+                let panel = Glass::new(Rect::new(bar.x, bar.y + bar.height + 20.0, bar.width, 320.0)).shape(Shape::Rounded(28.0));
+                ui.results = Some(self.scene.expand_from(ui.search, panel, Spring::new(0.5, 0.2)));
+            }
+        }
+    }
+
+    fn change_spacing(&mut self, by: f32) {
+        let Some(ui) = &self.ui else { return };
+        self.spacing = (self.spacing + by).max(0.0);
+        self.scene.set_container_spacing(ui.liquid, self.spacing);
+        println!("blob merge distance: {} pt", self.spacing);
     }
 
     fn redraw(&mut self) {
@@ -182,6 +206,23 @@ impl App {
     }
 
     fn key(&mut self, key: &Key) {
+        match key.as_ref() {
+            Key::Character("p") => {
+                self.scene.physics = !self.scene.physics;
+                println!("physics: {}", self.scene.physics);
+                return;
+            }
+            Key::Character("[") => return self.change_spacing(-4.0),
+            Key::Character("]") => return self.change_spacing(4.0),
+            Key::Character("f") => return self.toggle_search(),
+            Key::Named(NamedKey::Escape) => {
+                if self.ui.as_ref().is_some_and(|ui| ui.results.is_some()) {
+                    self.toggle_search();
+                }
+                return;
+            }
+            _ => {}
+        }
         let a = &mut self.scene.appearance;
         match key.as_ref() {
             Key::Character("1") => a.transparency = 0.0,
@@ -350,13 +391,13 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 self.scene.pointer_up();
-                let clicked_more = self
-                    .ui
-                    .as_mut()
-                    .and_then(|ui| ui.pressed.take().map(|(id, at)| id == ui.more && at.distance(self.cursor) < 8.0))
-                    .unwrap_or(false);
-                if clicked_more {
-                    self.toggle_menu();
+                let clicked = self.ui.as_mut().and_then(|ui| ui.pressed.take()).filter(|(_, at)| at.distance(self.cursor) < 8.0);
+                if let (Some((id, _)), Some(ui)) = (clicked, &self.ui) {
+                    if id == ui.more {
+                        self.toggle_menu();
+                    } else if id == ui.search {
+                        self.toggle_search();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => self.key(&event.logical_key),
@@ -378,8 +419,8 @@ fn main() {
             image::Rgba([c(0.5 + 0.5 * (7.0 * u).sin()), c(0.5 + 0.5 * (5.0 * v + 1.0).sin()), c(0.6 + 0.4 * (4.0 * (u - v)).cos()), 255])
         }),
     };
-    println!("Drag the lenses, press controls, click … (or Space) for the menu.");
-    println!("Keys: 1/2/3 transparency, D dark, R reduce transparency, C contrast, M reduce motion, L light, S scroll");
+    println!("Drag the lenses, press controls, click … (or Space) for the menu, click the search bar (or F) for results.");
+    println!("Keys: 1/2/3 transparency, D dark, R reduce transparency, C contrast, M reduce motion, P physics, [ ] merge distance, L light, S scroll");
     let mut app = App {
         image,
         gpu: None,
@@ -390,6 +431,7 @@ fn main() {
         scrolling: false,
         scroll: 0.0,
         light: 0.0,
+        spacing: 28.0,
         content_dirty: true,
         frames: 0,
         fps_clock: Instant::now(),

@@ -1,16 +1,17 @@
 //! Renders a scene offscreen and writes a PNG. No window needed.
 //!
 //! ```text
-//! cargo run --release --example snapshot -- [background.png] [out.png] [lock|home|corners|showcase|press|bench]
+//! cargo run --release --example snapshot -- [background.png] [out.png] [lock|home|corners|showcase|press|search|bench]
 //! ```
 //! An optional fourth argument sets the appearance: `ultra-clear`, `tinted`, `dark`,
 //! `reduce-transparency` or `increase-contrast`.
 //! `bench` renders the showcase 300 times with a cached and with a changing backdrop
 //! and prints the average GPU frame time.
+//! `search` catches a results panel mid-way through growing out of a search bar.
 //! `lock` and `home` recreate Apple's iOS 26/27 Figma kit controls at their kit
 //! positions (402 x 874 pt at 3x) so the result can be compared with the kit render.
 
-use liquid_rust::{Color, Frame, Glass, Material, Rect, Renderer, Scene, Shape, Vec2};
+use liquid_rust::{Color, Frame, Glass, Material, Rect, Renderer, Scene, Shape, Spring, Vec2};
 
 const SCALE: f32 = 3.0;
 const SIZE_PT: (f32, f32) = (402.0, 874.0);
@@ -28,6 +29,19 @@ fn kit_home(scene: &mut Scene) {
     scene.add(Glass::new(Rect::new(162.5, 704.0, 77.0, 30.0)).material(Material::clear_bar()));
     scene.add(Glass::new(Rect::new(28.0, 120.0, 250.0, 350.0)).shape(Shape::Rounded(30.0)).material(Material::regular()));
 }
+
+/// Search bar whose results panel is still growing out of it (`Scene::expand_from`).
+fn search(scene: &mut Scene) {
+    let bar = scene.add_container(16.0, 0);
+    let field = scene.add(Glass::new(Rect::new(40.0, 120.0, 322.0, 52.0)).interactive().container(bar));
+    while scene.update(1.0 / 120.0) {}
+    scene.expand_from(field, Glass::new(Rect::new(40.0, 192.0, 322.0, 420.0)).shape(Shape::Rounded(30.0)), Spring::new(0.5, 0.2));
+    for _ in 0..SEARCH_FRAMES {
+        scene.update(1.0 / 120.0);
+    }
+}
+
+const SEARCH_FRAMES: u32 = 12;
 
 fn showcase(scene: &mut Scene) {
     let bar = scene.add_container(18.0, 0);
@@ -86,9 +100,12 @@ fn main() {
         "showcase" | "press" | "bench" => showcase(&mut scene),
         "lock" => kit_lock(&mut scene),
         "corners" => corners(&mut scene),
+        "search" => search(&mut scene),
         _ => kit_home(&mut scene),
     }
-    while scene.update(1.0 / 120.0) {}
+    if which != "search" {
+        while scene.update(1.0 / 120.0) {}
+    }
     if which == "press" {
         scene.pointer_down(Vec2::new(69.0, 149.0));
         for _ in 0..12 {

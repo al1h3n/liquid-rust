@@ -10,7 +10,7 @@ categories = ["graphics", "gui", "rendering"]
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
-glam = { version = "0.33", features = ["bytemuck"] }
+glam = { version = "0.34", features = ["bytemuck"] }
 slotmap = "1"
 wgpu = { version = "30", default-features = false, features = ["wgsl"] }
 

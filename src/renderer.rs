@@ -14,6 +14,7 @@ use std::ops::Range;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
+use crate::material::thickness;
 use crate::scene::{Geometry, GlassId, Scene};
 
 /// Inputs for one frame.
@@ -48,6 +49,7 @@ struct ShapeGpu {
     center_half: [f32; 4],
     params: [f32; 4],
     stretch: [f32; 4],
+    extra: [f32; 4],
 }
 
 #[repr(C)]
@@ -78,6 +80,9 @@ struct Layer {
 #[derive(Default)]
 struct Packed {
     shapes: Vec<ShapeGpu>,
+    /// Two entries per group: the material resolved for its thinnest member, then for
+    /// its thickest. The shader blends them per pixel by each shape's thickness, so
+    /// fused glass keeps its own look and nothing jumps when a group splits.
     groups: Vec<GroupGpu>,
     layers: Vec<Layer>,
     /// Farthest any group samples beyond its bounds (refraction + blur), px.
@@ -179,61 +184,72 @@ fn pack(scene: &Scene, scale: f32, viewport: Vec2, out: &mut Packed) {
         let presence = |m: &Member| scene.nodes[m.id].presence.value.clamp(0.0, 1.0);
         let p = members.iter().map(presence).fold(0.0, f32::max);
         let press = members.iter().map(|m| scene.nodes[m.id].press.value).fold(0.0, f32::max).clamp(0.0, 1.5);
-        let min_side = members.iter().map(|m| m.geo.half.min_element() * 2.0).fold(0.0, f32::max);
-        let resolved = lead.glass.material.resolve(min_side, &scene.appearance);
-        let m = resolved.material;
+        let side = |m: &Member| m.geo.half.min_element() * 2.0;
+        let thinnest = members.iter().map(side).fold(f32::MAX, f32::min);
+        let thickest = members.iter().map(side).fold(0.0, f32::max);
+        let thin = lead.glass.material.resolve(thinnest, &scene.appearance);
+        let thick = lead.glass.material.resolve(thickest, &scene.appearance);
+        let (tau_thin, tau_thick) = (thickness(thinnest), thickness(thickest));
 
         let first = out.shapes.len() as u32;
         let mut bounds = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-        let mut min_half = f32::MAX;
+        let mut max_depth: f32 = 1.0;
         for member in &members {
             let g = member.geo;
             let pm = presence(member);
             let others = members.iter().any(|o| o.id != member.id && presence(o) > 0.5);
             let shrink = (1.0 - pm) * g.half.min_element() * if others { 1.0 } else { 0.15 };
             let along = 1.0 + g.stretch;
+            // Where this shape sits between the group's thin and thick material.
+            let blend = if tau_thick > tau_thin { (thickness(side(member)) - tau_thin) / (tau_thick - tau_thin) } else { 0.0 };
+            let depth = thin.material.depth + (thick.material.depth - thin.material.depth) * blend;
+            let depth = (depth * s).min(g.half.min_element() * s).max(1.0);
+            max_depth = max_depth.max(depth);
             out.shapes.push(ShapeGpu {
                 center_half: [g.center.x * s, g.center.y * s, g.half.x * s, g.half.y * s],
                 params: [g.radius * s, shrink * s, g.axis.x, g.axis.y],
                 stretch: [along, 1.0 / along, g.exponent, 0.0],
+                extra: [depth, blend, 0.0, 0.0],
             });
             let c = g.center * s;
             let r = g.reach() * s;
             bounds = union(bounds, [c.x - r.x, c.y - r.y, c.x + r.x, c.y + r.y]);
-            min_half = min_half.min(g.half.min_element() * s);
         }
 
+        // Thick glass frosts and shadows the most, so it sizes the quad for both.
+        let m = thick.material;
         let k = spacing * s;
         let shadow_sigma = m.shadow.blur * 0.5 * s;
         let margin = (m.shadow.offset_y.abs() * s + 3.0 * shadow_sigma).max(2.0 * s) + k * 0.25 + 1.0;
         let bounds = clamp_bounds(expand(bounds, margin), screen);
-        let depth = (m.depth * s).min(min_half).max(1.0);
-        let frost_sigma = m.frost * 0.5 * s * p;
-        out.reach = out.reach.max(depth * 1.2 * m.refraction + 8.0 * frost_sigma + 8.0);
+        out.reach = out.reach.max(max_depth * 1.2 * m.refraction + 8.0 * m.frost * 0.5 * s * p + 8.0);
 
         let tone_a = |t: crate::Tone| [t.lift * p, t.luminance, t.luminance_mix * p, t.lighten * p];
         let tone_b = |t: crate::Tone| [t.darken_to, t.darken * p, 0.0, 0.0];
-        let tint = m.tint.map_or([0.0; 4], |c| {
-            let lab = c.to_oklab();
-            // Stained glass, never a solid fill: full alpha keeps 15 % of the backdrop.
-            [lab[0], lab[1], lab[2], c.a * 0.85 * p]
-        });
-        out.groups.push(GroupGpu {
-            bounds,
-            info: [first, members.len() as u32, 0, 0],
-            geo: [k, p, press, resolved.adapt],
-            optics: [m.refraction * p, depth, m.dispersion * p, frost_sigma],
-            lighting: [m.splay, m.specular * p * (1.0 + 0.6 * press), m.rim * p, m.rim_shade * p],
-            edge: [m.hairline * p, m.edge * p, resolved.contrast * p, m.dim * p],
-            shadow: [m.shadow.offset_y * s, shadow_sigma, m.shadow.opacity * p, 0.0],
-            light_a: tone_a(m.light_tone),
-            light_b: tone_b(m.light_tone),
-            dark_a: tone_a(m.dark_tone),
-            dark_b: tone_b(m.dark_tone),
-            tint,
-        });
+        for resolved in [thin, thick] {
+            let m = resolved.material;
+            let tint = m.tint.map_or([0.0; 4], |c| {
+                let lab = c.to_oklab();
+                // Stained glass, never a solid fill: full alpha keeps 15 % of the backdrop.
+                [lab[0], lab[1], lab[2], c.a * 0.85 * p]
+            });
+            out.groups.push(GroupGpu {
+                bounds,
+                info: [first, members.len() as u32, 0, 0],
+                geo: [k, p, press, resolved.adapt],
+                optics: [m.refraction * p, 0.0, m.dispersion * p, m.frost * 0.5 * s * p],
+                lighting: [m.splay, m.specular * p * (1.0 + 0.6 * press), m.rim * p, m.rim_shade * p],
+                edge: [m.hairline * p, m.edge * p, resolved.contrast * p, m.dim * p],
+                shadow: [m.shadow.offset_y * s, m.shadow.blur * 0.5 * s, m.shadow.opacity * p, 0.0],
+                light_a: tone_a(m.light_tone),
+                light_b: tone_b(m.light_tone),
+                dark_a: tone_a(m.dark_tone),
+                dark_b: tone_b(m.dark_tone),
+                tint,
+            });
+        }
 
-        let index = out.groups.len() as u32 - 1;
+        let index = out.groups.len() as u32 / 2 - 1;
         let z = members[0].z;
         match out.layers.last_mut() {
             Some(layer) if layer.z == z => {
@@ -640,6 +656,33 @@ mod tests {
     #[test]
     fn glass_beyond_spacing_renders_separately() {
         assert_eq!(groups_for_gap(30.0), 2);
+    }
+
+    #[test]
+    fn container_spacing_changes_at_runtime() {
+        let mut scene = Scene::new();
+        let c = scene.add_container(20.0, 0);
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 50.0, 50.0)).container(c));
+        scene.add(Glass::new(Rect::new(80.0, 0.0, 50.0, 50.0)).container(c));
+        while scene.update(1.0 / 60.0) {}
+        assert_eq!(cluster(&scene).len(), 2);
+        scene.set_container_spacing(c, 40.0);
+        assert_eq!(cluster(&scene).len(), 1);
+    }
+
+    #[test]
+    fn fused_glass_keeps_its_own_thickness() {
+        let mut scene = Scene::new();
+        let c = scene.add_container(20.0, 0);
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 300.0, 52.0)).container(c));
+        scene.add(Glass::new(Rect::new(0.0, 60.0, 300.0, 400.0)).container(c));
+        while scene.update(1.0 / 60.0) {}
+        let mut packed = Packed::default();
+        pack(&scene, 1.0, Vec2::new(400.0, 500.0), &mut packed);
+        assert_eq!((packed.layers[0].groups.clone(), packed.groups.len()), (0..1, 2), "one group, thin + thick entries");
+        let blend: Vec<f32> = packed.shapes.iter().map(|s| s.extra[1]).collect();
+        assert_eq!(blend, [0.0, 1.0]);
+        assert!(packed.groups[1].shadow[1] > packed.groups[0].shadow[1], "thick entry casts the softer shadow");
     }
 
     #[test]

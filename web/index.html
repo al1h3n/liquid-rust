@@ -12,7 +12,7 @@
 </head>
 <body>
 <canvas id="glass"></canvas>
-<div id="hint">Drag the lens · press controls · 1/2/3 transparency · D dark · C contrast · R reduce transparency · M reduce motion · L light</div>
+<div id="hint">Drag the lens · click the search bar · 1/2/3 transparency · D dark · C contrast · R reduce transparency · M reduce motion · P physics · [ ] merge distance · L light</div>
 <script type="module">
 import init, { LiquidGlass } from "./pkg/liquid_rust_web.js";
 
@@ -33,7 +33,15 @@ const W = innerWidth, H = innerHeight;
 const bar = glass.addContainer(14, 0);
 for (let i = 0; i < 3; i++) glass.add(24 + i * 60, 24, 52, 52, -1, "regular", 0, true, false, bar, 0);
 glass.add(W - 134, 24, 110, 52, -1, "tinted", 0x0088ff, true, false, -1, 0);
-const liquid = glass.addContainer(28, 0);
+const searchBox = glass.addContainer(16, 2);
+const search = glass.add(W / 2 - 125, 24, 250, 52, -1, "regular", 0, true, false, searchBox, 0);
+let results = -1;
+const toggleSearch = () => {
+  if (results >= 0) { glass.collapseInto(results, search); results = -1; }
+  else results = glass.expandFrom(search, W / 2 - 125, 96, 250, 320, 28, "regular", 0);
+};
+let spacing = 28;
+const liquid = glass.addContainer(spacing, 0);
 glass.add(80, 200, 140, 140, -1, "clear", 0, false, false, liquid, 0);
 glass.add(236, 240, 96, 96, -1, "clear", 0, false, false, liquid, 0);
 glass.add(120, 400, 96, 96, -1, "clear", 0, false, true, liquid, 0);
@@ -55,9 +63,19 @@ const wake = () => {
 };
 wake();
 
-canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); glass.pointerDown(e.clientX, e.clientY); wake(); });
+let pressed = null;
+canvas.addEventListener("pointerdown", (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  pressed = { id: glass.pointerDown(e.clientX, e.clientY), x: e.clientX, y: e.clientY };
+  wake();
+});
 canvas.addEventListener("pointermove", (e) => { glass.pointerMove(e.clientX, e.clientY); wake(); });
-canvas.addEventListener("pointerup", () => { glass.pointerUp(); wake(); });
+canvas.addEventListener("pointerup", (e) => {
+  glass.pointerUp();
+  if (pressed?.id === search && Math.hypot(e.clientX - pressed.x, e.clientY - pressed.y) < 8) toggleSearch();
+  pressed = null;
+  wake();
+});
 
 const state = {
   t: matchMedia("(prefers-reduced-transparency: reduce)").matches ? 1 : 0.5,
@@ -65,6 +83,7 @@ const state = {
   rt: false,
   ic: matchMedia("(prefers-contrast: more)").matches,
   rm: matchMedia("(prefers-reduced-motion: reduce)").matches,
+  physics: true,
   light: 0,
 };
 const apply = () => { glass.setAppearance(state.t, state.dark, state.rt, state.ic, state.rm); wake(); };
@@ -75,6 +94,9 @@ addEventListener("keydown", (e) => {
   else if (k === "d") state.dark = !state.dark; else if (k === "c") state.ic = !state.ic;
   else if (k === "r") state.rt = !state.rt; else if (k === "m") state.rm = !state.rm;
   else if (k === "l") { state.light += 90; glass.setLightAngle(state.light); }
+  else if (k === "p") { state.physics = !state.physics; glass.setPhysics(state.physics); }
+  else if (k === "[" || k === "]") { spacing = Math.max(0, spacing + (k === "]" ? 4 : -4)); glass.setContainerSpacing(liquid, spacing); }
+  else if (k === "f" || (k === "escape" && results >= 0)) toggleSearch();
   apply();
 });
 </script>

@@ -19,13 +19,14 @@ struct Shape {
     center_half: vec4f, // center (px), half size (px)
     params: vec4f,      // corner radius, inward shrink, stretch axis (x, y)
     stretch: vec4f,     // scale along axis, scale across axis, corner exponent, unused
+    extra: vec4f,       // bevel depth (px), thickness (0 = group's thin entry, 1 = thick), unused, unused
 };
 
 struct Group {
     bounds: vec4f,      // quad: min (px), max (px)
     info: vec4u,        // first shape, shape count, unused, unused
     geo: vec4f,         // union radius k (px), presence, press, light/dark adaptivity
-    optics: vec4f,      // refraction, depth (px), dispersion, frost sigma (px)
+    optics: vec4f,      // refraction, unused (depth is per shape), dispersion, frost sigma (px)
     lighting: vec4f,    // splay, specular, rim, rim shade
     edge: vec4f,        // inner hairline, outer edge burn, contrast border, dim
     shadow: vec4f,      // offset y (px), sigma (px), opacity, unused
@@ -38,6 +39,7 @@ struct Group {
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var<storage, read> shapes: array<Shape>;
+// Two entries per group: material for its thinnest member, then for its thickest.
 @group(0) @binding(2) var<storage, read> groups: array<Group>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var src: texture_2d<f32>;
@@ -56,7 +58,7 @@ struct Varyings {
 
 @vertex
 fn vs_glass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> Varyings {
-    let b = groups[ii].bounds;
+    let b = groups[2u * ii].bounds;
     let corner = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
     let px = mix(b.xy, b.zw, corner);
     var out: Varyings;
@@ -93,7 +95,8 @@ fn sdg_rrect(p: vec2f, half: vec2f, r: f32, n: f32, soft: f32) -> vec3f {
     return vec3f(g - r, sg * normalize(e));
 }
 
-fn sdg_shape(p: vec2f, s: Shape, soft: f32) -> vec3f {
+fn sdg_shape(p: vec2f, s: Shape) -> vec3f {
+    let soft = s.extra.x * 0.35;
     let axis = s.params.zw;
     let across = vec2f(-axis.y, axis.x);
     let rel = p - s.center_half.xy;
@@ -105,23 +108,50 @@ fn sdg_shape(p: vec2f, s: Shape, soft: f32) -> vec3f {
     return vec3f(dg.x * m + s.params.y, grad);
 }
 
-// Quadratic smooth minimum carrying the gradient (Inigo Quilez).
-fn smin_g(a: vec3f, b: vec3f, k: f32) -> vec3f {
+// Quadratic smooth minimum (Inigo Quilez): the blended distance, and how much of `b`
+// to mix into anything carried along with it.
+fn smin_w(a: f32, b: f32, k: f32) -> vec2f {
     if k <= 0.0 {
-        return select(b, a, a.x < b.x);
+        return vec2f(min(a, b), select(1.0, 0.0, a < b));
     }
-    let h = max(k - abs(a.x - b.x), 0.0);
-    let m = 0.25 * h * h / k;
+    let h = max(k - abs(a - b), 0.0);
     let n = 0.5 * h / k;
-    return vec3f(min(a.x, b.x) - m, mix(a.yz, b.yz, select(1.0 - n, n, a.x < b.x)));
+    return vec2f(min(a, b) - 0.25 * h * h / k, select(1.0 - n, n, a < b));
 }
 
-fn sdg_group(p: vec2f, grp: Group, soft: f32) -> vec3f {
-    var acc = sdg_shape(p, shapes[grp.info.x], soft);
+fn sdg_group(p: vec2f, grp: Group) -> vec3f {
+    var acc = sdg_shape(p, shapes[grp.info.x]);
     for (var i = 1u; i < grp.info.y; i++) {
-        acc = smin_g(acc, sdg_shape(p, shapes[grp.info.x + i], soft), grp.geo.x);
+        let b = sdg_shape(p, shapes[grp.info.x + i]);
+        let w = smin_w(acc.x, b.x, grp.geo.x);
+        acc = vec3f(w.x, mix(acc.yz, b.yz, w.y));
     }
     return acc;
+}
+
+struct Field {
+    dg: vec3f,   // distance and normal, as sdg_group
+    attrs: vec4f, // per-shape bevel depth (px), thickness, centre (px), blended as the shapes fuse
+};
+
+fn field_group(p: vec2f, grp: Group) -> Field {
+    let first = shapes[grp.info.x];
+    var dg = sdg_shape(p, first);
+    var attrs = vec4f(first.extra.xy, first.center_half.xy);
+    for (var i = 1u; i < grp.info.y; i++) {
+        let s = shapes[grp.info.x + i];
+        let b = sdg_shape(p, s);
+        let w = smin_w(dg.x, b.x, grp.geo.x);
+        dg = vec3f(w.x, mix(dg.yz, b.yz, w.y));
+        attrs = mix(attrs, vec4f(s.extra.xy, s.center_half.xy), w.y);
+    }
+    return Field(dg, attrs);
+}
+
+fn mix_group(a: Group, b: Group, t: f32) -> Group {
+    return Group(a.bounds, a.info, mix(a.geo, b.geo, t), mix(a.optics, b.optics, t), mix(a.lighting, b.lighting, t),
+        mix(a.edge, b.edge, t), mix(a.shadow, b.shadow, t), mix(a.light_a, b.light_a, t), mix(a.light_b, b.light_b, t),
+        mix(a.dark_a, b.dark_a, t), mix(a.dark_b, b.dark_b, t), mix(a.tint, b.tint, t));
 }
 
 // ---------------------------------------------------------------- maths helpers
@@ -263,8 +293,8 @@ fn refract_offset(slope: f32, eta: f32) -> f32 {
 
 // Inner shadow in Figma's sense: present where the shape is not covered by itself
 // shifted by `offset` and grown by `grow`, blurred by `sigma`.
-fn inner_shadow(p: vec2f, grp: Group, offset: vec2f, grow: f32, sigma: f32, soft: f32) -> f32 {
-    let hole = sdg_group(p - offset, grp, soft).x - grow;
+fn inner_shadow(p: vec2f, grp: Group, offset: vec2f, grow: f32, sigma: f32) -> f32 {
+    let hole = sdg_group(p - offset, grp).x - grow;
     return phi(hole, sigma);
 }
 
@@ -272,18 +302,20 @@ fn inner_shadow(p: vec2f, grp: Group, offset: vec2f, grow: f32, sigma: f32, soft
 
 @fragment
 fn fs_glass(v: Varyings) -> @location(0) vec4f {
-    let grp = groups[v.group];
     let p = v.pos.xy;
     let pt = globals.misc.x;
-    let depth = max(grp.optics.y, 1.0);
-    let soft = depth * 0.35;
+    let thin = groups[2u * v.group];
+    let field = field_group(p, thin);
+    let attrs = field.attrs;
+    let grp = mix_group(thin, groups[2u * v.group + 1u], attrs.y);
+    let depth = max(attrs.x, 1.0);
 
-    let dg = sdg_group(p, grp, soft);
+    let dg = field.dg;
     let glen = max(length(dg.yz), 1e-3);
     let d = dg.x / glen;
     let n = dg.yz / glen;
     let cov = coverage(d);
-    let center_uv = (grp.bounds.xy + grp.bounds.zw) * 0.5 * globals.viewport.zw;
+    let center_uv = attrs.zw * globals.viewport.zw;
 
     // Outside: drop shadow and the darkened hairline edge.
     var dark = 0.0;
@@ -295,15 +327,15 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
         let adapt = mix(0.7, 1.6, smoothstep(0.02, 0.12, detail)) * mix(1.0, 0.65, smoothstep(0.5, 0.85, mean));
         var shadow = 0.0;
         if grp.shadow.z > 0.0 {
-            let shadow_d = sdg_group(p - vec2f(0.0, grp.shadow.x), grp, soft).x;
+            let shadow_d = sdg_group(p - vec2f(0.0, grp.shadow.x), grp).x;
             shadow = grp.shadow.z * adapt * (1.0 - phi(shadow_d, grp.shadow.y));
         }
 
         var edge_dark = 0.0;
         if grp.edge.y > 0.0 && d < 2.0 * pt {
             let ring = clamp(coverage(d - 0.5 * pt) - cov, 0.0, 1.0);
-            let side_l = coverage(sdg_group(p + vec2f(1.25 * pt, 0.0), grp, soft).x + 0.75 * pt);
-            let side_r = coverage(sdg_group(p - vec2f(1.25 * pt, 0.0), grp, soft).x + 0.75 * pt);
+            let side_l = coverage(sdg_group(p + vec2f(1.25 * pt, 0.0), grp).x + 0.75 * pt);
+            let side_r = coverage(sdg_group(p - vec2f(1.25 * pt, 0.0), grp).x + 0.75 * pt);
             let burn = grp.edge.y * (ring + 0.92 * max(side_l, side_r) * (1.0 - cov));
             let under = encode(textureLoad(src, vec2i(p), 0).rgb);
             let burnt = max(under - vec3f(burn), vec3f(0.0));
@@ -373,15 +405,15 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
         let o = KIT_OFFSET * pt;
         let away = -to_light * o; // shadow offset that lights the edge facing the light
         if grp.lighting.z > 0.0 {
-            let rims = inner_shadow(p, grp, away, o, rim_sigma, soft) + inner_shadow(p, grp, -away, o, rim_sigma, soft);
+            let rims = inner_shadow(p, grp, away, o, rim_sigma) + inner_shadow(p, grp, -away, o, rim_sigma);
             g += vec3f(grp.lighting.z * rims);
         }
         if grp.lighting.w > 0.0 {
-            g -= vec3f(grp.lighting.w * inner_shadow(p, grp, away, o, 15.0 * pt, soft));
+            g -= vec3f(grp.lighting.w * inner_shadow(p, grp, away, o, 15.0 * pt));
         }
         if grp.edge.x > 0.0 {
             let h = -to_light * 1.25 * pt;
-            let lines = inner_shadow(p, grp, h, 0.0, 0.125 * pt, soft) + inner_shadow(p, grp, -h, 0.0, 0.125 * pt, soft);
+            let lines = inner_shadow(p, grp, h, 0.0, 0.125 * pt) + inner_shadow(p, grp, -h, 0.0, 0.125 * pt);
             g += vec3f(grp.edge.x * lines);
         }
     }
