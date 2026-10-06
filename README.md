@@ -114,7 +114,7 @@ Every field maps to a knob in Figma's GLASS panel (`refraction`, `depth`, `dispe
 ## Examples
 
 ```bash
-cargo run --release --example demo -- path/to/wallpaper.jpg
+cargo run -r --example demo -- path/to/wallpaper.jpg
 ```
 
 In the demo, drag the lens: it fuses with the blobs. Click `…` or press Space to morph a button into a
@@ -123,7 +123,7 @@ physics on and off, and `[` / `]` change the blobs' merge distance. Other keys: 
 the accessibility settings, `L` to sweep the light, `S` to scroll content under the glass.
 
 ```bash
-cargo run --release --example snapshot -- wallpaper.png out.png home
+cargo run -r --example snapshot -- wallpaper.png out.png home
 ```
 
 The snapshot example renders headless. Modes: `lock`, `home` (Apple kit positions),
