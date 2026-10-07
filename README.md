@@ -1,5 +1,7 @@
 https://github.com/user-attachments/assets/4a06584f-4293-4b74-a245-508b1248128f
 
+**[Try the live demo](https://al1h3n.github.io/liquid-rust-showcase/)** (WebGPU) · [showcase source](https://github.com/al1h3n/liquid-rust-showcase)
+
 # Liquid Rust
 
 Apple-style **Liquid Glass** for [`wgpu`] 30, on native GPUs (Vulkan, Metal, DX12, GL) and in
@@ -88,7 +90,8 @@ scene.collapse_into(results, bar, Spring::new(0.35, 0.0));
   The new glass starts at the bar's current frame, fused with it. It stretches a liquid neck
   while it grows and pinches off once the gap passes half the spacing. Here the gap ends at
   20 pt, past the 16 pt spacing, so both shapes settle clean. For the two to stay joined, end
-  the gap under half the spacing instead.
+  the gap under half the spacing instead. The outline morphs as well: glass grown out of a
+  round button starts round and eases into its own corners, and collapses back into a circle.
 
 ## Contract
 
@@ -174,3 +177,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 [`wgpu`]: https://wgpu.rs
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

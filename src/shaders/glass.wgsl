@@ -421,7 +421,10 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
     // Touch: the glass lights up from the finger; the light spills onto nearby glass.
     let tp = p - globals.touch.xy;
     let glow = globals.touch.w * exp(-dot(tp, tp) / max(globals.touch.z * globals.touch.z, 1.0));
-    g += vec3f(0.22 * glow + 0.03 * grp.geo.z);
+    // Screen blend: light only fills the headroom that is left, so over light content
+    // the glass brightens a little instead of clipping to an opaque white disc, while
+    // over dark content it keeps nearly the full lift.
+    g += vec3f(0.22 * glow + 0.03 * grp.geo.z) * (1.0 - clamp(g, vec3f(0.0), vec3f(1.0)));
 
     // Increase Contrast: a border in the label colour.
     if grp.edge.z > 0.0 {

@@ -186,6 +186,9 @@ pub(crate) struct Node {
     pub lift: Animated,
     pub stretch: Animated,
     pub stretch_dir: Vec2,
+    /// Outline being morphed away from: `morph` 0 draws this shape, 1 draws `glass.shape`.
+    pub from_shape: Shape,
+    pub morph: Animated,
     pub removing: bool,
     pub order: u64,
 }
@@ -336,6 +339,8 @@ impl Scene {
             lift: at(0.0),
             stretch: at(0.0),
             stretch_dir: Vec2::X,
+            from_shape: glass.shape,
+            morph: at(1.0),
             removing: false,
             order: self.next_order,
         })
@@ -366,24 +371,44 @@ impl Scene {
     /// `source`, stretches a liquid neck and pinches off once the gap passes half the
     /// container's spacing; end at least the full spacing away for clean shapes (see
     /// [`Container::spacing`]). Outside a container it materializes instead.
+    ///
+    /// The outline morphs too: the new glass starts with `source`'s shape (a round
+    /// button stays round) and eases into its own corners as it grows.
     pub fn expand_from(&mut self, source: GlassId, mut glass: Glass, spring: Spring) -> GlassId {
         let Some(start) = self.current_frame(source) else { return self.add(glass) };
         glass.container = glass.container.or(self.nodes[source].glass.container);
         let fused = self.fuses(source, glass.container);
+        let from_shape = self.nodes[source].glass.shape;
         let target = glass.frame;
         let id = self.add(Glass { frame: start, ..glass });
+        let morph = self.spring(spring);
+        let node = &mut self.nodes[id];
         if fused {
-            self.nodes[id].presence.snap(1.0);
+            node.presence.snap(1.0);
         }
+        node.from_shape = from_shape;
+        node.morph.snap(0.0);
+        node.morph.animate_to(1.0, morph);
         self.set_frame_with(id, target, spring);
         id
     }
 
-    /// Reverse of [`Scene::expand_from`]: springs `id` back into `target`'s frame. Fused
-    /// glass is dropped once it has merged back in; otherwise it dematerializes.
+    /// Reverse of [`Scene::expand_from`]: springs `id` back into `target`'s frame and
+    /// outline. Fused glass is dropped once it has merged back in; otherwise it
+    /// dematerializes.
     pub fn collapse_into(&mut self, id: GlassId, target: GlassId, spring: Spring) {
-        let Some(frame) = self.glass(target).map(|g| g.frame) else { return self.remove(id) };
+        let Some((frame, shape)) = self.glass(target).map(|g| (g.frame, g.shape)) else { return self.remove(id) };
         self.set_frame_with(id, frame, spring);
+        let morph = self.spring(spring);
+        if let Some(node) = self.nodes.get_mut(id) {
+            // Morph back toward the target's outline. Collapsing mid-expand keeps going
+            // from where it is, since the expand started from that same outline.
+            if node.from_shape != shape {
+                node.from_shape = shape;
+                node.morph.snap(1.0);
+            }
+            node.morph.animate_to(0.0, morph);
+        }
         let container = self.glass(id).and_then(|g| g.container);
         if self.fuses(target, container) {
             self.nodes[id].removing = true;
@@ -421,10 +446,12 @@ impl Scene {
         }
     }
 
-    /// Replaces the outline.
+    /// Replaces the outline (instantly).
     pub fn set_shape(&mut self, id: GlassId, shape: Shape) {
         if let Some(node) = self.nodes.get_mut(id) {
             node.glass.shape = shape;
+            node.from_shape = shape;
+            node.morph.snap(1.0);
         }
     }
 
@@ -523,6 +550,7 @@ impl Scene {
                 &mut node.press,
                 &mut node.lift,
                 &mut node.stretch,
+                &mut node.morph,
             ] {
                 moving |= a.step(dt);
             }
@@ -530,7 +558,7 @@ impl Scene {
         moving |= self.touch.intensity.step(dt);
         moving |= self.touch.radius.step(dt);
         moving |= self.light_angle.step(dt);
-        self.nodes.retain(|_, n| !(n.removing && [&n.presence, &n.x, &n.y, &n.w, &n.h].iter().all(|a| a.is_at_rest())));
+        self.nodes.retain(|_, n| !(n.removing && [&n.presence, &n.x, &n.y, &n.w, &n.h, &n.morph].iter().all(|a| a.is_at_rest())));
         moving || self.drag.as_ref().is_some_and(|d| d.velocity != Vec2::ZERO)
     }
 
@@ -538,7 +566,7 @@ impl Scene {
     fn settle(&mut self) {
         for node in self.nodes.values_mut() {
             node.stretch.target = 0.0;
-            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch] {
+            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph] {
                 a.snap(a.target);
             }
         }
@@ -578,12 +606,19 @@ impl Scene {
         let scale = 1.0 + node.press.value * grow + node.lift.value * LENS_LIFT;
         let half = size * 0.5 * scale;
         let budget = half.min_element();
-        let (radius, exponent) = match node.glass.shape {
+        let corner = |shape| match shape {
             Shape::Capsule => (budget, 2.0),
             Shape::Circular(r) => ((r * scale).min(budget), 2.0),
             Shape::Rounded(r) => smooth_corner(r * scale, IOS_SMOOTHING, budget),
             Shape::Smooth { radius, smoothing } => smooth_corner(radius * scale, smoothing, budget),
         };
+        let (mut radius, mut exponent) = corner(node.glass.shape);
+        let t = node.morph.value.clamp(0.0, 1.0);
+        if t < 1.0 {
+            let (r0, e0) = corner(node.from_shape);
+            radius = r0 + (radius - r0) * t;
+            exponent = e0 + (exponent - e0) * t;
+        }
         Geometry {
             center: Vec2::new(node.x.value, node.y.value) + size * 0.5,
             half,
@@ -707,6 +742,34 @@ mod tests {
         scene.collapse_into(panel, bar, Spring::SNAPPY);
         settle(&mut scene);
         assert!(scene.glass(panel).is_none());
+    }
+
+    #[test]
+    fn expand_and_collapse_morph_the_outline() {
+        // A round button growing into a rounded menu must start and end round: no
+        // squircle frame on top of the circle, no snap when the menu is dropped.
+        for reduce_motion in [false, true] {
+            let mut scene = Scene::new();
+            scene.appearance.reduce_motion = reduce_motion;
+            let c = scene.add_container(18.0, 0);
+            let button = scene.add(Glass::new(Rect::new(300.0, 100.0, 88.0, 88.0)).container(c));
+            settle(&mut scene);
+            let round = scene.geometry(&scene.nodes[button]);
+            let menu = scene.expand_from(button, Glass::new(Rect::new(40.0, 40.0, 236.0, 214.0)).shape(Shape::Rounded(28.0)), Spring::new(0.5, 0.2));
+            let start = scene.geometry(&scene.nodes[menu]);
+            assert_eq!((start.radius, start.exponent), (round.radius, round.exponent), "starts as the button's circle");
+            settle(&mut scene);
+            let open = scene.geometry(&scene.nodes[menu]);
+            assert_eq!((open.radius, open.exponent), smooth_corner(28.0, IOS_SMOOTHING, 107.0), "settles on its own corners");
+
+            scene.collapse_into(menu, button, Spring::new(0.38, 0.0));
+            let mut last = open;
+            while scene.nodes.contains_key(menu) {
+                last = scene.geometry(&scene.nodes[menu]);
+                scene.update(1.0 / 120.0);
+            }
+            assert!((last.radius - round.radius).abs() < 0.05 && (last.exponent - 2.0).abs() < 0.01, "dropped as a circle: {last:?}");
+        }
     }
 
     #[test]

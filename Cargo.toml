@@ -1,10 +1,13 @@
 [package]
 name = "liquid-rust"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Apple-style Liquid Glass for wgpu: SDF glass groups, refraction, frost, rim light, analytic springs. Native and WebGPU."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/al1h3n/liquid-rust"
+homepage = "https://al1h3n.github.io/liquid-rust-showcase/"
+documentation = "https://docs.rs/liquid-rust"
 keywords = ["liquid-glass", "wgpu", "webgpu", "ui", "glassmorphism"]
 categories = ["graphics", "gui", "rendering"]
 
