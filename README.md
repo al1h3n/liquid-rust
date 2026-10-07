@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/4a06584f-4293-4b74-a245-508b1248128f
+
 # Liquid Rust
 
 Apple-style **Liquid Glass** for [`wgpu`] 30, on native GPUs (Vulkan, Metal, DX12, GL) and in
