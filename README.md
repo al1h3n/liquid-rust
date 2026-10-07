@@ -1,4 +1,4 @@
-https://github.com/user-attachments/assets/4a06584f-4293-4b74-a245-508b1248128f
+https://github.com/user-attachments/assets/80811c7a-5de5-4d94-99e6-00bc5331f0ab
 
 **[Try the live demo](https://al1h3n.github.io/liquid-rust-showcase/)** (WebGPU) · [showcase source](https://github.com/al1h3n/liquid-rust-showcase)
 
