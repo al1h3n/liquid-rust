@@ -1,6 +1,6 @@
 [package]
 name = "liquid-rust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.99"
 description = "Apple-style Liquid Glass for wgpu: SDF glass groups, refraction, frost, rim light, analytic springs. Native and WebGPU."

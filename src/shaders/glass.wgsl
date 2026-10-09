@@ -286,9 +286,10 @@ fn bevel_slope(t: f32) -> f32 {
 // Lateral travel (in units of glass thickness) of a vertical ray refracted by a
 // surface tilted by atan(slope).
 fn refract_offset(slope: f32, eta: f32) -> f32 {
-    let s = slope / sqrt(1.0 + slope * slope);
-    let theta = asin(s);
-    return tan(theta - asin(s / eta));
+    // atan, not asin(slope / sqrt(1 + slope²)): at the very edge the slope is ~5600 and
+    // that ratio can round above 1, which made asin NaN and left black pixels on the rim.
+    let theta = atan(slope);
+    return tan(theta - asin(clamp(sin(theta) / eta, -1.0, 1.0)));
 }
 
 // Inner shadow in Figma's sense: present where the shape is not covered by itself
@@ -332,14 +333,22 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
         }
 
         var edge_dark = 0.0;
-        if grp.edge.y > 0.0 && d < 2.0 * pt {
-            let ring = clamp(coverage(d - 0.5 * pt) - cov, 0.0, 1.0);
-            let side_l = coverage(sdg_group(p + vec2f(1.25 * pt, 0.0), grp).x + 0.75 * pt);
-            let side_r = coverage(sdg_group(p - vec2f(1.25 * pt, 0.0), grp).x + 0.75 * pt);
+        if grp.edge.y > 0.0 && d < 2.5 * pt {
+            // At least one device pixel wide: a thinner line can't antialias and turns into
+            // a staircase of dark pixels on 1x screens.
+            let line_w = max(0.5 * pt, 1.0);
+            let grow = max(0.75 * pt, 1.0);
+            let ring = clamp(coverage(d - line_w) - cov, 0.0, 1.0);
+            let side_l = coverage(sdg_group(p + vec2f(1.25 * pt, 0.0), grp).x + grow);
+            let side_r = coverage(sdg_group(p - vec2f(1.25 * pt, 0.0), grp).x + grow);
             let burn = grp.edge.y * (ring + 0.92 * max(side_l, side_r) * (1.0 - cov));
             let under = encode(textureLoad(src, vec2i(p), 0).rgb);
             let burnt = max(under - vec3f(burn), vec3f(0.0));
-            edge_dark = 1.0 - luminance(decode(burnt)) / max(luminance(decode(under)), 1e-4);
+            let darkening = 1.0 - luminance(decode(burnt)) / max(luminance(decode(under)), 1e-4);
+            // The kit's linear burn defines the edge over light content. Over dark content a
+            // fixed burn clips to pure black (a jagged black outline), so the darkening is
+            // capped and fades out where there is nothing light to define the edge against.
+            edge_dark = min(darkening, 0.45) * smoothstep(0.12, 0.45, luminance(under));
         }
         dark = 1.0 - (1.0 - clamp(shadow, 0.0, 1.0)) * (1.0 - clamp(edge_dark, 0.0, 1.0));
         dark *= 1.0 - cov;
