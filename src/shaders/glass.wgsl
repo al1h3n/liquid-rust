@@ -429,7 +429,10 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
 
     // Touch: the glass lights up from the finger; the light spills onto nearby glass.
     let tp = p - globals.touch.xy;
-    let glow = globals.touch.w * exp(-dot(tp, tp) / max(globals.touch.z * globals.touch.z, 1.0));
+    // Glass that isn't pressed only catches a little of it, so a held button doesn't outline
+    // the panels around it.
+    let spill = 0.25 + 0.75 * clamp(grp.geo.z, 0.0, 1.0);
+    let glow = spill * globals.touch.w * exp(-dot(tp, tp) / max(globals.touch.z * globals.touch.z, 1.0));
     // Screen blend: light only fills the headroom that is left, so over light content
     // the glass brightens a little instead of clipping to an opaque white disc, while
     // over dark content it keeps nearly the full lift.
@@ -441,7 +444,10 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
         g = mix(g, vec3f(1.0 - step(0.5, lightness)), border * grp.edge.z);
     }
 
-    // Materialize needs no alpha: the CPU scales every effect by presence, so at 0 the
-    // glass is exactly the untouched backdrop.
-    return vec4f(decode(g) * cov, cov + dark);
+    // Materialize: the CPU scales every effect by presence, so at 0 the glass is exactly
+    // the untouched backdrop. Coverage follows presence too, so glass that only samples the
+    // content (`Scene::glass_on_glass` off) doesn't punch a hole in the glass below it the
+    // moment it appears; over plain content the two are the same picture.
+    let a = cov * clamp(grp.geo.y, 0.0, 1.0);
+    return vec4f(decode(g) * a, a + dark);
 }

@@ -6,10 +6,15 @@
 //!    can sample — Apple samples its backdrop at quarter resolution, we go further;
 //! 3. draw every glass group as one instanced quad, z-layer by z-layer;
 //! 4. when a higher layer overlaps lower glass, re-render the lower glass into an
-//!    offscreen backdrop for just that region and rebuild the pyramid there, so glass
-//!    on glass refracts what is really below it. Non-overlapping layers cost nothing.
+//!    offscreen backdrop for just that region and blur it into a second pyramid, so
+//!    glass on glass refracts what is really below it. Non-overlapping layers cost
+//!    nothing. With [`Scene::glass_on_glass`] off, every layer samples the content instead.
+//!
+//! Only pixels are cached, never motion: the blur of content that holds still is kept
+//! from frame to frame, while every spring is solved and every shape drawn fresh, so
+//! glass always refracts what is behind it right now.
 
-use std::ops::Range;
+use std::ops::{Bound, Range, RangeBounds};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
@@ -28,9 +33,9 @@ pub struct Frame<'a> {
     pub size: (u32, u32),
     /// Pixels per point (device pixel ratio).
     pub scale: f32,
-    /// Set when `content` differs from the previous frame. When `false` and the glass
-    /// still covers the same region, the blur pyramid is reused (zero blur cost for
-    /// static wallpapers).
+    /// Set when `content` differs from the previous frame. While it stays `false` the
+    /// blur pyramid is reused, wherever the glass moves (zero blur cost over static
+    /// wallpapers). `true` is always correct, only slower.
     pub content_changed: bool,
 }
 
@@ -121,13 +126,16 @@ fn find(parent: &mut [usize], mut i: usize) -> usize {
     i
 }
 
-/// Splits live glass into render groups: one per container cluster whose members are
-/// within `spacing` of each other, one per loose glass.
-fn cluster(scene: &Scene) -> Vec<Vec<Member>> {
+/// Stacking orders to draw, as [`Renderer::render_layers`] takes them.
+type Layers = (Bound<i32>, Bound<i32>);
+
+/// Splits live glass on `layers` into render groups: one per container cluster whose
+/// members are within `spacing` of each other, one per loose glass.
+fn cluster(scene: &Scene, layers: Layers) -> Vec<Vec<Member>> {
     let mut members: Vec<Member> = scene
         .nodes
         .iter()
-        .filter(|(_, n)| !n.glass.material.is_identity() && n.presence.value > 1e-3)
+        .filter(|(_, n)| !n.glass.material.is_identity() && n.presence.value > 1e-3 && layers.contains(&scene.z_of(n)))
         .map(|(id, n)| Member {
             id,
             geo: scene.geometry(n),
@@ -166,11 +174,13 @@ fn cluster(scene: &Scene) -> Vec<Vec<Member>> {
         }
         groups[slot[root]].push(m);
     }
-    groups.sort_by_key(|g| (g[0].z, g[0].order));
+    // Within a layer a group draws by its newest member: glass that just grew out of a group
+    // (a menu out of its button) covers older glass it overlaps, not the other way round.
+    groups.sort_by_key(|g| (g[0].z, g.iter().map(|m| m.order).max().unwrap_or(0)));
     groups
 }
 
-fn pack(scene: &Scene, scale: f32, viewport: Vec2, out: &mut Packed) {
+fn pack(scene: &Scene, layers: Layers, scale: f32, viewport: Vec2, out: &mut Packed) {
     out.shapes.clear();
     out.groups.clear();
     out.layers.clear();
@@ -178,7 +188,7 @@ fn pack(scene: &Scene, scale: f32, viewport: Vec2, out: &mut Packed) {
     let s = scale;
     let screen = [0.0, 0.0, viewport.x, viewport.y];
 
-    for members in cluster(scene) {
+    for members in cluster(scene, layers) {
         let lead = &scene.nodes[members[0].id];
         let spacing = lead.glass.container.and_then(|c| scene.containers.get(c)).map_or(0.0, |c| c.spacing);
         let presence = |m: &Member| scene.nodes[m.id].presence.value.clamp(0.0, 1.0);
@@ -408,9 +418,13 @@ pub struct Renderer {
     globals: wgpu::Buffer,
     shapes: wgpu::Buffer,
     groups: wgpu::Buffer,
+    /// Blur of the content alone.
     pyramid: Option<Pyramid>,
+    /// Blur of a layer backdrop (content plus the glass below it). Made, with
+    /// `layer_textures`, the first time glass overlaps glass.
+    layered: Option<Pyramid>,
     layer_textures: Vec<wgpu::TextureView>,
-    /// Region of the pyramid that currently holds a valid blur of the content.
+    /// Region of `pyramid` that currently holds a valid blur of the content.
     cached: Option<Bounds>,
     packed: Packed,
 }
@@ -485,6 +499,7 @@ impl Renderer {
             groups: storage(device, "liquid-rust groups", size_of::<GroupGpu>() as u64 * 16),
             pipelines,
             pyramid: None,
+            layered: None,
             layer_textures: Vec::new(),
             cached: None,
             packed: Packed::default(),
@@ -497,12 +512,42 @@ impl Renderer {
     }
 
     /// Records commands that draw `frame.content` plus all glass of `scene` into
-    /// `frame.target`.
+    /// `frame.target`. Does nothing for an empty (`0 x 0`) frame, such as a minimized window.
     pub fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame<'_>, scene: &Scene) {
+        self.render_layers(device, queue, encoder, frame, scene, ..);
+    }
+
+    /// Like [`Renderer::render`], but draws only the glass whose stacking order
+    /// ([`Glass::z`](crate::Glass::z), or its container's) is in `layers`.
+    ///
+    /// This is how glass refracts the labels of the glass beneath it. Labels are drawn on
+    /// top after `render`, so in one pass nothing can bend them. Split the scene instead:
+    /// draw the lower layers into a texture, draw their labels onto it, then hand that
+    /// texture to a second renderer as the `content` of the upper layers.
+    ///
+    /// ```no_run
+    /// # fn demo(device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, scene: &liquid_rust::Scene,
+    /// #     lower: &mut liquid_rust::Renderer, upper: &mut liquid_rust::Renderer,
+    /// #     content: &wgpu::TextureView, middle: &wgpu::TextureView, target: &wgpu::TextureView) {
+    /// # use liquid_rust::Frame;
+    /// # let (size, scale) = ((1206, 2622), 3.0);
+    /// lower.render_layers(device, queue, encoder, &Frame { content, target: middle, size, scale, content_changed: false }, scene, ..2);
+    /// // ... draw the labels of layers 0 and 1 into `middle` ...
+    /// upper.render_layers(device, queue, encoder, &Frame { content: middle, target, size, scale, content_changed: true }, scene, 2..);
+    /// # }
+    /// ```
+    ///
+    /// Use one renderer per pass: each keeps the blur of its own content.
+    pub fn render_layers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, frame: &Frame<'_>, scene: &Scene, layers: impl RangeBounds<i32>) {
         let size = frame.size;
-        pack(scene, frame.scale, Vec2::new(size.0 as f32, size.1 as f32), &mut self.packed);
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        let layers = (layers.start_bound().cloned(), layers.end_bound().cloned());
+        pack(scene, layers, frame.scale, Vec2::new(size.0 as f32, size.1 as f32), &mut self.packed);
         if self.pyramid.as_ref().is_none_or(|p| p.size != size) {
             self.pyramid = Some(Pyramid::new(device, &self.pipelines, size));
+            self.layered = None;
             self.layer_textures.clear();
             self.cached = None;
         }
@@ -520,33 +565,45 @@ impl Renderer {
         let mut rebuild = vec![false; layers.len()];
         let mut below = layers[0].bounds;
         for (i, layer) in layers.iter().enumerate().skip(1) {
-            rebuild[i] = intersects(expand(layer.bounds, reach), below);
+            rebuild[i] = scene.glass_on_glass && intersects(expand(layer.bounds, reach), below);
             below = union(below, layer.bounds);
         }
-        if rebuild.iter().any(|&r| r) && self.layer_textures.is_empty() {
+        if rebuild.contains(&true) && self.layer_textures.is_empty() {
             self.layer_textures = (0..2).map(|_| layer_texture(device, self.format, size)).collect();
+            self.layered = Some(Pyramid::new(device, &self.pipelines, size));
         }
 
         let Some(pyramid) = &self.pyramid else { return };
         let region = tail(0);
-        let reuse = !frame.content_changed && self.cached.is_some_and(|c| contains(c, region));
-        if !reuse {
+        if frame.content_changed || !self.cached.is_some_and(|c| contains(c, region)) {
+            // Content that holds still is blurred across the whole screen, once: the glass
+            // can then move anywhere over it without another build.
+            let region = if frame.content_changed { region } else { screen };
             pyramid.build(device, &self.pipelines, encoder, frame.content, region);
             self.cached = Some(region);
         }
 
-        let mut src = frame.content;
+        // `src` is the backdrop the next layer refracts, `blur` its pyramid, and `baked` the
+        // number of layers already drawn into it.
+        let (mut src, mut blur, mut baked, mut slot) = (frame.content, pyramid, 0, 0);
         for (i, layer) in layers.iter().enumerate() {
-            if rebuild[i] {
+            if let (true, Some(layered)) = (rebuild[i], &self.layered) {
                 let region = tail(i);
-                let dst = &self.layer_textures[i % 2];
+                // Alternate by rebuild, not by layer index: with a layer in between that
+                // needs no rebuild, the index would read and write the same texture.
+                let dst = &self.layer_textures[slot];
+                slot ^= 1;
                 blit(device, &self.pipelines, encoder, src, dst, Some(region), size);
-                self.draw_layer(device, encoder, &layers[i - 1], src, dst, Some(region), size);
-                pyramid.build(device, &self.pipelines, encoder, dst, region);
-                self.cached = None;
-                src = dst;
+                // Every layer since the last rebuild, not just the one below: all of them
+                // are under this layer.
+                for lower in &layers[baked..i] {
+                    self.draw_layer(device, encoder, lower, src, blur, dst, Some(region), size);
+                }
+                // A pyramid of its own, so the blur of the content stays cached.
+                layered.build(device, &self.pipelines, encoder, dst, region);
+                (src, blur, baked) = (dst, layered, i);
             }
-            self.draw_layer(device, encoder, layer, src, frame.target, None, size);
+            self.draw_layer(device, encoder, layer, src, blur, frame.target, None, size);
         }
     }
 
@@ -576,8 +633,7 @@ impl Renderer {
     }
 
     #[expect(clippy::too_many_arguments, reason = "plain pass recording, no state to bundle")]
-    fn draw_layer(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, layer: &Layer, src: &wgpu::TextureView, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
-        let Some(pyramid) = &self.pyramid else { return };
+    fn draw_layer(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, layer: &Layer, src: &wgpu::TextureView, blur: &Pyramid, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("liquid-rust glass"),
             layout: &self.pipelines.glass.get_bind_group_layout(0),
@@ -587,7 +643,7 @@ impl Renderer {
                 wgpu::BindGroupEntry { binding: 2, resource: self.groups.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.pipelines.sampler) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&pyramid.full) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&blur.full) },
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -639,13 +695,15 @@ mod tests {
     use super::*;
     use crate::{Glass, Rect};
 
+    const ALL_LAYERS: Layers = (Bound::Unbounded, Bound::Unbounded);
+
     fn groups_for_gap(gap: f32) -> usize {
         let mut scene = Scene::new();
         let c = scene.add_container(20.0, 0);
         scene.add(Glass::new(Rect::new(0.0, 0.0, 50.0, 50.0)).container(c));
         scene.add(Glass::new(Rect::new(50.0 + gap, 0.0, 50.0, 50.0)).container(c));
         while scene.update(1.0 / 60.0) {}
-        cluster(&scene).len()
+        cluster(&scene, ALL_LAYERS).len()
     }
 
     #[test]
@@ -665,9 +723,9 @@ mod tests {
         scene.add(Glass::new(Rect::new(0.0, 0.0, 50.0, 50.0)).container(c));
         scene.add(Glass::new(Rect::new(80.0, 0.0, 50.0, 50.0)).container(c));
         while scene.update(1.0 / 60.0) {}
-        assert_eq!(cluster(&scene).len(), 2);
+        assert_eq!(cluster(&scene, ALL_LAYERS).len(), 2);
         scene.set_container_spacing(c, 40.0);
-        assert_eq!(cluster(&scene).len(), 1);
+        assert_eq!(cluster(&scene, ALL_LAYERS).len(), 1);
     }
 
     #[test]
@@ -678,11 +736,24 @@ mod tests {
         scene.add(Glass::new(Rect::new(0.0, 60.0, 300.0, 400.0)).container(c));
         while scene.update(1.0 / 60.0) {}
         let mut packed = Packed::default();
-        pack(&scene, 1.0, Vec2::new(400.0, 500.0), &mut packed);
+        pack(&scene, ALL_LAYERS, 1.0, Vec2::new(400.0, 500.0), &mut packed);
         assert_eq!((packed.layers[0].groups.clone(), packed.groups.len()), (0..1, 2), "one group, thin + thick entries");
         let blend: Vec<f32> = packed.shapes.iter().map(|s| s.extra[1]).collect();
         assert_eq!(blend, [0.0, 1.0]);
         assert!(packed.groups[1].shadow[1] > packed.groups[0].shadow[1], "thick entry casts the softer shadow");
+    }
+
+    #[test]
+    fn a_group_that_grew_new_glass_draws_last() {
+        let mut scene = Scene::new();
+        let bar = scene.add_container(16.0, 0);
+        let button = scene.add(Glass::new(Rect::new(0.0, 0.0, 44.0, 44.0)).container(bar));
+        let pill = scene.add(Glass::new(Rect::new(0.0, 300.0, 140.0, 44.0)));
+        scene.expand_from(button, Glass::new(Rect::new(0.0, 0.0, 300.0, 400.0)).shape(crate::Shape::Rounded(28.0)), crate::Spring::SNAPPY);
+        while scene.update(1.0 / 60.0) {}
+        let groups = cluster(&scene, ALL_LAYERS);
+        assert_eq!(groups.last().map(|g| g.len()), Some(2), "the menu's group is drawn after the pill");
+        assert!(groups.iter().any(|g| g.iter().any(|m| m.id == pill)));
     }
 
     #[test]
@@ -692,7 +763,25 @@ mod tests {
         scene.add(Glass::new(Rect::new(10.0, 10.0, 50.0, 50.0)).z(1));
         while scene.update(1.0 / 60.0) {}
         let mut packed = Packed::default();
-        pack(&scene, 2.0, Vec2::new(200.0, 200.0), &mut packed);
+        pack(&scene, ALL_LAYERS, 2.0, Vec2::new(200.0, 200.0), &mut packed);
         assert_eq!(packed.layers.len(), 2);
+    }
+
+    #[test]
+    fn a_layer_range_packs_only_its_glass() {
+        let mut scene = Scene::new();
+        let menus = scene.add_container(16.0, 1);
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 50.0, 50.0)));
+        scene.add(Glass::new(Rect::new(60.0, 0.0, 50.0, 50.0)).container(menus));
+        scene.add(Glass::new(Rect::new(10.0, 10.0, 50.0, 50.0)).z(2));
+        while scene.update(1.0 / 60.0) {}
+        let z = |layers: Layers| {
+            let mut packed = Packed::default();
+            pack(&scene, layers, 1.0, Vec2::new(200.0, 200.0), &mut packed);
+            packed.layers.iter().map(|l| l.z).collect::<Vec<_>>()
+        };
+        assert_eq!(z(ALL_LAYERS), [0, 1, 2]);
+        assert_eq!(z((Bound::Unbounded, Bound::Excluded(2))), [0, 1], "a container counts by its own z");
+        assert_eq!(z((Bound::Included(2), Bound::Unbounded)), [2]);
     }
 }

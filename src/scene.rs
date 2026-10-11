@@ -266,6 +266,11 @@ pub struct Scene {
     /// instantly, and press growth, lens lift and stretch are skipped. Liquid merging is
     /// geometry, not physics; control it with container spacing.
     pub physics: bool,
+    /// `true` (default): a higher layer refracts the glass rendered below it, rebuilt only
+    /// where the layers overlap. `false` follows Apple's rule that glass can't sample glass:
+    /// every layer refracts the content alone and covers the glass beneath it, so a menu
+    /// over a toolbar shows the backdrop, never ghosts of the buttons below.
+    pub glass_on_glass: bool,
     pub(crate) light_angle: Animated,
     pub(crate) touch: Touch,
     pressed: Option<GlassId>,
@@ -287,6 +292,7 @@ impl Scene {
             containers: SlotMap::with_key(),
             appearance: Appearance::default(),
             physics: true,
+            glass_on_glass: true,
             light_angle: Animated::new(0.0, LIGHT_SWEEP),
             touch: Touch {
                 pos: Vec2::ZERO,
@@ -419,7 +425,7 @@ impl Scene {
 
     /// `true` when glass in `container` liquid-merges with `other`.
     fn fuses(&self, other: GlassId, container: Option<ContainerId>) -> bool {
-        container.is_some_and(|c| self.glass(other).is_some_and(|g| g.container == Some(c)) && self.containers[c].spacing > 0.0)
+        container.is_some_and(|c| self.glass(other).is_some_and(|g| g.container == Some(c)) && self.containers.get(c).is_some_and(|c| c.spacing > 0.0))
     }
 
     /// Moves/resizes with the default morph spring (`.snappy`).
@@ -437,6 +443,17 @@ impl Scene {
         node.y.animate_to(frame.y, spring);
         node.w.animate_to(frame.width, spring);
         node.h.animate_to(frame.height, spring);
+    }
+
+    /// Moves/resizes instantly, keeping no velocity: for layout that jumps rather than
+    /// animates (a window resize, a scrolled page), where a spring would trail behind.
+    pub fn place(&mut self, id: GlassId, frame: Rect) {
+        let Some(node) = self.nodes.get_mut(id) else { return };
+        node.glass.frame = frame;
+        node.x.snap(frame.x);
+        node.y.snap(frame.y);
+        node.w.snap(frame.width);
+        node.h.snap(frame.height);
     }
 
     /// Replaces the material (instantly).
@@ -462,13 +479,15 @@ impl Scene {
         self.light_angle.animate_to(degrees, spring);
     }
 
-    /// Topmost interactive or lens glass under `p`.
+    /// Topmost glass under `p`, if it is interactive or a lens. Glass on top takes the press
+    /// even when it doesn't react to it: a menu over a button never presses the button.
     pub fn hit_test(&self, p: Vec2) -> Option<GlassId> {
         self.nodes
             .iter()
-            .filter(|(_, n)| !n.removing && (n.glass.interactive || n.glass.lens))
+            .filter(|(_, n)| !n.removing && !n.glass.material.is_identity())
             .filter(|(_, n)| self.geometry(n).contains(p))
             .max_by_key(|(_, n)| (self.z_of(n), n.order))
+            .filter(|(_, n)| n.glass.interactive || n.glass.lens)
             .map(|(id, _)| id)
     }
 
@@ -536,8 +555,12 @@ impl Scene {
             self.settle();
             return false;
         }
-        let dt = dt.clamp(0.0, 1.0 / 30.0);
-        self.update_drag_stretch(dt);
+        // `max` first: a NaN step (a first frame with no previous timestamp) counts as zero.
+        let elapsed = dt.max(0.0);
+        let dt = elapsed.min(1.0 / 30.0);
+        // Drag speed is travel over the real time since the last update. Over the clamped
+        // step, a stalled frame would read as a fast drag and flash a full stretch.
+        self.update_drag_stretch(elapsed);
 
         let mut moving = false;
         for node in self.nodes.values_mut() {
@@ -689,6 +712,24 @@ mod tests {
     }
 
     #[test]
+    fn place_lands_without_animating() {
+        let mut scene = Scene::new();
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)));
+        settle(&mut scene);
+        scene.place(id, Rect::new(300.0, 10.0, 60.0, 40.0));
+        assert_eq!(scene.current_frame(id), Some(Rect::new(300.0, 10.0, 60.0, 40.0)));
+        assert!(!scene.update(1.0 / 120.0));
+    }
+
+    #[test]
+    fn glass_on_top_blocks_presses_below() {
+        let mut scene = Scene::new();
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 100.0, 100.0)).interactive());
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 100.0, 100.0)).shape(Shape::Rounded(20.0)).z(1));
+        assert_eq!(scene.hit_test(Vec2::new(50.0, 50.0)), None);
+    }
+
+    #[test]
     fn lens_follows_pointer_and_settles() {
         let mut scene = Scene::new();
         let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)).lens());
@@ -711,6 +752,42 @@ mod tests {
             scene.update(1.0 / 120.0);
         }
         assert!(scene.nodes[id].stretch.value > 0.1);
+    }
+
+    #[test]
+    fn stalled_frame_does_not_fake_a_fast_drag() {
+        // 100 pt in half a second is a slow drag, however long the frame took.
+        let mut scene = Scene::new();
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)).lens());
+        settle(&mut scene);
+        scene.pointer_down(Vec2::new(20.0, 20.0));
+        scene.pointer_move(Vec2::new(120.0, 20.0));
+        scene.update(0.5);
+        assert!(scene.nodes[id].stretch.target < 0.02, "stretch {}", scene.nodes[id].stretch.target);
+    }
+
+    #[test]
+    fn bad_input_never_keeps_the_scene_animating() {
+        let mut scene = Scene::new();
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)));
+        assert!(scene.update(f32::NAN), "a NaN step moves nothing");
+        settle(&mut scene);
+        scene.set_frame(id, Rect::new(f32::NAN, 10.0, f32::INFINITY, 40.0));
+        scene.set_frame_with(id, Rect::new(f32::NAN, 10.0, f32::INFINITY, 40.0), Spring::new(0.0, 7.0));
+        settle(&mut scene);
+        assert!(!scene.update(1.0 / 120.0));
+        assert_eq!(scene.current_frame(id), Some(Rect::new(0.0, 10.0, 40.0, 40.0)), "finite parts land, the rest stay put");
+    }
+
+    #[test]
+    fn expanding_from_glass_in_an_unknown_container_does_not_panic() {
+        let foreign = Scene::new().add_container(20.0, 0);
+        let mut scene = Scene::new();
+        let source = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)).container(foreign));
+        let grown = scene.expand_from(source, Glass::new(Rect::new(0.0, 60.0, 200.0, 200.0)), Spring::SNAPPY);
+        scene.collapse_into(grown, source, Spring::SNAPPY);
+        settle(&mut scene);
+        assert!(scene.glass(grown).is_none());
     }
 
     #[test]

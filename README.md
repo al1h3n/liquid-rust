@@ -36,7 +36,12 @@ lock-screen button and the dock match the kit's render pixel profile for pixel p
   to Figma's geometry within 0.74 % of the radius. `Shape::Circular` gives quarter circles, and
   `Shape::Smooth { radius, smoothing }` takes any Figma smoothing value.
 - **Glass on glass.** A higher z-layer refracts the glass that is really under it. The backdrop
-  is rebuilt only where layers overlap, and non-overlapping layers cost nothing.
+  is rebuilt only where layers overlap, and non-overlapping layers cost nothing. Apple's own
+  rule is that glass can't sample glass: `scene.glass_on_glass = false` makes every layer
+  refract the content alone and cover the glass beneath it (menus over toolbars), and presses
+  always go to the topmost glass. `scene.appearance.adapt_to_content = false` keeps small
+  glass on the colour scheme instead of flipping with the content, for labels that follow
+  the scheme.
 
 ```rust
 use liquid_rust::{Color, Frame, Glass, Material, Rect, Renderer, Scene, Shape};
@@ -57,7 +62,7 @@ renderer.render(&device, &queue, &mut encoder, &Frame {
     target: &target_view,     // same size; sRGB (or float) view in the renderer's format
     size: (width, height),
     scale: scale_factor,      // pixels per point
-    content_changed: true,    // false => blur pyramid reused (static wallpapers cost ~0)
+    content_changed: true,    // false while the content holds still => its blur is reused
 }, &scene);
 ```
 
@@ -76,6 +81,7 @@ Animate layout with `scene.set_frame(id, rect)`. Use `scene.remove(id)` to demat
 - **Physics off.** `scene.physics = false` makes every change land on the next `update`: no
   springs, press growth, lens lift or stretch. Use it for static UI, tests or layout work.
   `appearance.reduce_motion` is the gentler option: it keeps the motion and drops the bounce.
+  `scene.place(id, frame)` moves one glass instantly (a window resize) without a spring.
 - **Grow one glass out of another.** For example, a search bar opening into its results:
 
 ```rust
@@ -101,7 +107,21 @@ scene.collapse_into(results, bar, Spring::new(0.35, 0.0));
   render through that view (see `web/`).
 - Draw your glyphs and labels on top after `render`. Use vibrancy: additive / plus-lighter
   for light text, multiply / plus-darker for dark text. Don't put glass on glass for that.
+- Glass stacked over labelled glass (a lens over a menu) should bend those labels too, and
+  labels drawn after `render` are on top of everything. Split the frame with
+  `render_layers`: lower layers into a texture, their labels onto it, then that texture as
+  the `content` of a second renderer for the upper layers.
+
+  ```rust
+  lower.render_layers(&device, &queue, &mut encoder, &Frame { content: &content_view, target: &middle_view, size, scale, content_changed }, &scene, ..2);
+  // draw the labels of layers 0 and 1 into `middle`
+  upper.render_layers(&device, &queue, &mut encoder, &Frame { content: &middle_view, target: &target_view, size, scale, content_changed: true }, &scene, 2..);
+  ```
 - The scene is in points, top-left origin. `Frame::scale` converts points to pixels.
+- Bad input is absorbed, not propagated. A `0 x 0` render size (a minimized window) is
+  skipped. A NaN time step counts as zero, a NaN or infinite coordinate leaves that value
+  where it was, and `bounce` is solved within ±0.95, so `scene.update` always comes to rest
+  and returns `false`.
 
 ## Presets
 
@@ -151,17 +171,31 @@ Then open `http://localhost:8000/index.html?bg=your-image.png`. `web/src/lib.rs`
 ## Performance
 
 The `bench` snapshot draws 8 glass groups with liquid merging and a glass-on-glass layer at
-1206×2622 (iPhone 3x) in **0.6–0.7 ms per frame** on an RTX 30-series GPU. Where the cost goes:
+1206×2622 (iPhone 3x) in **0.7 ms per frame** over static content and **0.8 ms** over content
+that changes every frame, on an RTX 3060 Ti, at rest or with a sheet springing across a panel.
+Where the cost goes:
 
 - One full-screen copy of the content.
-- A blur pyramid limited to the region the glass can actually sample. It is skipped entirely
-  when `content_changed` is false.
+- A blur pyramid limited to the region the glass can actually sample.
 - One instanced quad per glass group. Every distance-field evaluation stays inside that quad,
   and the inner rim shadows are skipped deep inside large glass.
 - CPU work per frame is O(n) per container plus a buffer upload. Clustering is O(n²) within a
   container, which is fine for tens of shapes.
-- `Scene::update` returns `false` when everything is at rest, so the host can stop rendering.
 - Glass on glass costs extra only where a higher layer overlaps lower glass.
+
+### What is cached, and what never is
+
+- **The blur of content that holds still.** While `content_changed` stays `false` the pyramid
+  is built once for the whole screen and then reused, wherever the glass moves and whether or
+  not layers overlap. Layer backdrops are blurred into a pyramid of their own, so glass on
+  glass no longer throws the content's blur away. A test renders every frame of a moving
+  sheet both ways and compares them.
+- **Whole frames.** `Scene::update` returns `false` when everything is at rest, so the host
+  stops rendering: idle glass costs nothing.
+- **Never motion.** Springs are not baked into curves or keyframes and glass is not played
+  back from stored frames. A baked curve can't be retargeted mid-flight with its velocity,
+  and stored glass would refract a backdrop that is no longer there. Solving a spring is a
+  few dozen floating-point operations, so there is nothing to win either.
 
 ## Tests
 
@@ -169,8 +203,10 @@ The `bench` snapshot draws 8 glass groups with liquid merging and a glass-on-gla
 cargo test
 ```
 
-Unit tests cover springs, materials, scene interaction and clustering. GPU tests render a frame
-and check the compositing contract, and they skip themselves when there is no GPU adapter.
+Unit tests cover springs, materials, scene interaction, clustering and bad input (NaN, runaway
+bounce). GPU tests render frames and check the compositing contract, stacked layers and the
+backdrop cache; they skip themselves when there is no GPU adapter. The shaders are also
+validated with naga alone, so a machine without a GPU still catches a WGSL error.
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings

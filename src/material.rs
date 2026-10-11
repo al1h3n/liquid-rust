@@ -243,11 +243,15 @@ pub struct Appearance {
     pub increase_contrast: bool,
     /// Reduce Motion: no bounce, no stretch, no press scale.
     pub reduce_motion: bool,
+    /// `true` (Apple's default): small adaptive glass flips light or dark with the content
+    /// behind it. `false`: it follows [`Appearance::dark`] like large glass, for interfaces
+    /// whose labels follow the colour scheme and would vanish on flipped glass.
+    pub adapt_to_content: bool,
 }
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { dark: false, transparency: 0.5, reduce_transparency: false, increase_contrast: false, reduce_motion: false }
+        Self { dark: false, transparency: 0.5, reduce_transparency: false, increase_contrast: false, reduce_motion: false, adapt_to_content: true }
     }
 }
 
@@ -290,7 +294,9 @@ impl Material {
             m.shadow.opacity += 0.19 * tau;
             m.light_tone.lighten += 0.5 * tau;
             m.dark_tone.darken += 0.27 * tau;
-            adapt = 1.0 - tau;
+            if appearance.adapt_to_content {
+                adapt = 1.0 - tau;
+            }
         }
 
         let mut k = (appearance.transparency.clamp(0.0, 1.0) - 0.5) * 2.0;
@@ -298,11 +304,26 @@ impl Material {
             k = 1.0;
             m.frost = (m.frost * 3.0).max(20.0);
         }
-        m.frost *= (1.1 * k).exp2();
-        for tone in [&mut m.light_tone, &mut m.dark_tone] {
-            tone.luminance_mix = more_opaque(tone.luminance_mix, 0.45 * k);
-            tone.lighten = more_opaque(tone.lighten, 0.35 * k).min(0.9);
-            tone.darken = more_opaque(tone.darken, 0.45 * k).min(0.9);
+        if k > 0.0 && !appearance.reduce_transparency {
+            // Toward "fully tinted" (iOS 26.1: "increases opacity and adds more contrast"): a
+            // more opaque face and stronger rims, but frost grows only a little, so the bevel
+            // still visibly bends the content behind it.
+            m.frost *= (0.5 * k).exp2();
+            for tone in [&mut m.light_tone, &mut m.dark_tone] {
+                tone.luminance_mix = more_opaque(tone.luminance_mix, 0.35 * k);
+                tone.lighten = more_opaque(tone.lighten, 0.25 * k).min(0.85);
+                tone.darken = more_opaque(tone.darken, 0.35 * k).min(0.85);
+            }
+            m.edge = (m.edge + 0.25 * k).min(1.0);
+            m.rim += 0.08 * k;
+            m.specular += 0.08 * k;
+        } else {
+            m.frost *= (1.1 * k).exp2();
+            for tone in [&mut m.light_tone, &mut m.dark_tone] {
+                tone.luminance_mix = more_opaque(tone.luminance_mix, 0.45 * k);
+                tone.lighten = more_opaque(tone.lighten, 0.35 * k).min(0.9);
+                tone.darken = more_opaque(tone.darken, 0.45 * k).min(0.9);
+            }
         }
 
         let contrast = if appearance.increase_contrast {
@@ -344,6 +365,24 @@ mod tests {
         let tinted = Appearance { transparency: 1.0, ..Appearance::default() };
         let r = Material::regular().resolve(44.0, &tinted).material;
         assert!(r.light_tone.lighten > Material::regular().light_tone.lighten);
+    }
+
+    #[test]
+    fn fully_tinted_keeps_the_bevel_visible() {
+        // The refraction must still read: frost grows by at most √2 and refraction is untouched,
+        // while rims and the outer edge get stronger.
+        let tinted = Appearance { transparency: 1.0, ..Appearance::default() };
+        let base = Material::regular().resolve(44.0, &Appearance::default()).material;
+        let r = Material::regular().resolve(44.0, &tinted).material;
+        assert!(r.frost <= base.frost * 1.42);
+        assert_eq!(r.refraction, base.refraction);
+        assert!(r.edge > base.edge && r.rim > base.rim);
+    }
+
+    #[test]
+    fn small_glass_follows_the_scheme_when_not_adapting_to_content() {
+        let a = Appearance { adapt_to_content: false, ..Appearance::default() };
+        assert_eq!(Material::regular().resolve(44.0, &a).adapt, 0.0);
     }
 
     #[test]

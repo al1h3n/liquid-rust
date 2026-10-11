@@ -18,7 +18,7 @@ use std::f32::consts::TAU;
 pub struct Spring {
     /// Perceptual duration in seconds.
     pub duration: f32,
-    /// Bounce in `-1.0..1.0`.
+    /// Bounce in `-1.0..1.0`. Solved within `-0.95..=0.95`, where a spring still settles.
     pub bounce: f32,
 }
 
@@ -43,11 +43,10 @@ impl Spring {
     }
 
     fn damping_ratio(self) -> f32 {
-        if self.bounce >= 0.0 {
-            1.0 - self.bounce
-        } else {
-            1.0 / (1.0 + self.bounce)
-        }
+        // At a bounce of 1 the spring rings forever and the host never stops rendering;
+        // at -1 the ratio is infinite, and past either end the value runs away.
+        let bounce = self.bounce.clamp(-0.95, 0.95);
+        if bounce >= 0.0 { 1.0 - bounce } else { 1.0 / (1.0 + bounce) }
     }
 
     /// Advances displacement `x0` and velocity `v0` by `t` seconds, returning the new
@@ -117,6 +116,16 @@ impl Animated {
             return false;
         }
         let (x, v) = self.spring.solve(self.value - self.target, self.velocity, dt);
+        if !(x.is_finite() && v.is_finite()) {
+            // A NaN or infinite target, step or spring (a layout that divided by zero) lands
+            // at once; left alone it would never come to rest.
+            if !self.target.is_finite() {
+                self.target = if self.value.is_finite() { self.value } else { 0.0 };
+            }
+            self.value = self.target;
+            self.velocity = 0.0;
+            return false;
+        }
         self.value = self.target + x;
         self.velocity = v;
         true
@@ -167,6 +176,30 @@ mod tests {
     #[test]
     fn spring_settles_within_two_durations() {
         assert!(settle(Spring::SNAPPY, 120, 1.0 / 120.0).is_at_rest());
+    }
+
+    #[test]
+    fn bounce_outside_apples_range_still_settles() {
+        for bounce in [1.0, 3.0, -1.0, -3.0] {
+            let a = settle(Spring::new(0.2, bounce), 40_000, 1.0 / 120.0);
+            assert!(a.is_at_rest(), "bounce {bounce} left the value at {}", a.value);
+        }
+    }
+
+    #[test]
+    fn non_finite_input_lands_instead_of_animating_forever() {
+        let mut a = Animated::new(5.0, Spring::SNAPPY);
+        a.animate_to(f32::NAN, Spring::SNAPPY);
+        assert!(!a.step(1.0 / 120.0));
+        assert_eq!((a.value, a.target), (5.0, 5.0), "a NaN target is dropped");
+
+        a.animate_to(9.0, Spring::new(f32::NAN, f32::NAN));
+        assert!(!a.step(1.0 / 120.0));
+        assert_eq!(a.value, 9.0, "a NaN spring lands on the target");
+
+        a.animate_to(2.0, Spring::SNAPPY);
+        assert!(!a.step(f32::NAN));
+        assert_eq!(a.value, 2.0, "a NaN step lands on the target");
     }
 
     #[test]
