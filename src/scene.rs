@@ -193,6 +193,19 @@ pub(crate) struct Node {
     pub order: u64,
 }
 
+impl Node {
+    /// A removed node is gone once nothing of it shows: faded out, or (merging into its
+    /// target) within a tenth of a point of the target frame with its outline morphed back.
+    /// Point-sized springs need about a second more to settle to [`Animated::is_at_rest`]'s
+    /// 1e-3; meanwhile the node kept reporting a frame nobody could see.
+    fn is_gone(&self) -> bool {
+        let faded = self.presence.target <= 0.0 && self.presence.value < 0.01;
+        let near = |a: &Animated, tolerance: f32| (a.value - a.target).abs() < tolerance && a.velocity.abs() < tolerance * 10.0;
+        let merged = [&self.x, &self.y, &self.w, &self.h].iter().all(|a| near(a, 0.1)) && near(&self.morph, 0.005) && near(&self.presence, 0.01);
+        faded || merged
+    }
+}
+
 /// Current, animated outline of a node in points.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Geometry {
@@ -581,7 +594,7 @@ impl Scene {
         moving |= self.touch.intensity.step(dt);
         moving |= self.touch.radius.step(dt);
         moving |= self.light_angle.step(dt);
-        self.nodes.retain(|_, n| !(n.removing && [&n.presence, &n.x, &n.y, &n.w, &n.h, &n.morph].iter().all(|a| a.is_at_rest())));
+        self.nodes.retain(|_, n| !(n.removing && n.is_gone()));
         moving || self.drag.as_ref().is_some_and(|d| d.velocity != Vec2::ZERO)
     }
 
@@ -673,6 +686,20 @@ mod tests {
         scene.remove(id);
         settle(&mut scene);
         assert!(scene.glass(id).is_none());
+    }
+
+    #[test]
+    fn removed_glass_is_dropped_once_it_stops_showing() {
+        let mut scene = Scene::new();
+        let source = scene.add(Glass::new(Rect::new(0.0, 0.0, 44.0, 44.0)));
+        let panel = scene.add(Glass::new(Rect::new(0.0, 100.0, 400.0, 600.0)));
+        settle(&mut scene);
+        scene.collapse_into(panel, source, Spring::new(0.5, 0.15));
+        // Dematerializing takes 0.3 s; the frame's spring tail must not keep it around.
+        for _ in 0..60 {
+            scene.update(1.0 / 120.0);
+        }
+        assert!(scene.current_frame(panel).is_none(), "still reports {:?}", scene.current_frame(panel));
     }
 
     #[test]
@@ -845,7 +872,8 @@ mod tests {
                 last = scene.geometry(&scene.nodes[menu]);
                 scene.update(1.0 / 120.0);
             }
-            assert!((last.radius - round.radius).abs() < 0.05 && (last.exponent - 2.0).abs() < 0.01, "dropped as a circle: {last:?}");
+            // Dropped within a sub-pixel of the button's circle (merged, nothing left to see).
+            assert!((last.radius - round.radius).abs() < 0.1 && (last.exponent - 2.0).abs() < 0.01, "dropped as a circle: {last:?}");
         }
     }
 
