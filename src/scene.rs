@@ -384,6 +384,16 @@ impl Scene {
         self.nodes.get(id).map(|n| Rect::new(n.x.value, n.y.value, n.w.value, n.h.value))
     }
 
+    /// Corner on screen right now, mid-morph: how far the corner reaches along each edge and
+    /// its superellipse exponent (2 is a circular arc, iOS corners are about 2.8). A page that
+    /// clips content to growing glass uses it to cut exactly where the glass ends.
+    pub fn current_corner(&self, id: GlassId) -> Option<(f32, f32)> {
+        self.nodes.get(id).map(|node| {
+            let geometry = self.geometry(node);
+            (geometry.radius, geometry.exponent)
+        })
+    }
+
     /// Grows new glass out of `source`: it starts at `source`'s current frame and springs
     /// to `glass.frame`, like a search bar opening into its results. Without a container
     /// of its own, `glass` joins `source`'s; sharing a container, it emerges fused to
@@ -686,6 +696,18 @@ mod tests {
         scene.remove(id);
         settle(&mut scene);
         assert!(scene.glass(id).is_none());
+    }
+
+    #[test]
+    fn current_corner_morphs_from_the_source_outline() {
+        let mut scene = Scene::new();
+        let button = scene.add(Glass::new(Rect::new(300.0, 100.0, 44.0, 44.0)));
+        settle(&mut scene);
+        let panel = scene.expand_from(button, Glass::new(Rect::new(40.0, 40.0, 300.0, 200.0)).shape(Shape::Rounded(24.0)), Spring::new(0.5, 0.15));
+        assert_eq!(scene.current_corner(panel), Some((22.0, 2.0)), "starts as the button's circle");
+        settle(&mut scene);
+        let (radius, exponent) = scene.current_corner(panel).unwrap();
+        assert_eq!((radius, exponent), smooth_corner(24.0, IOS_SMOOTHING, 100.0));
     }
 
     #[test]
