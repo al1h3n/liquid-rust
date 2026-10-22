@@ -42,6 +42,10 @@ impl Spring {
         Self::new(self.duration * 0.8, self.bounce.min(0.0))
     }
 
+    fn angular_frequency(self) -> f32 {
+        TAU / self.duration.max(1e-3)
+    }
+
     fn damping_ratio(self) -> f32 {
         // At a bounce of 1 the spring rings forever and the host never stops rendering;
         // at -1 the ratio is infinite, and past either end the value runs away.
@@ -52,7 +56,7 @@ impl Spring {
     /// Advances displacement `x0` and velocity `v0` by `t` seconds, returning the new
     /// displacement and velocity.
     pub fn solve(self, x0: f32, v0: f32, t: f32) -> (f32, f32) {
-        let w0 = TAU / self.duration.max(1e-3);
+        let w0 = self.angular_frequency();
         let zeta = self.damping_ratio();
         if zeta < 1.0 {
             let a = zeta * w0;
@@ -91,6 +95,11 @@ pub struct Animated {
 
 const REST_EPSILON: f32 = 1e-3;
 
+/// Far from zero an `f32` can't hold a value within [`REST_EPSILON`] of its target and
+/// stops a few float steps short: 1/8192 apart at 1024, 1/16 at a million. A spring whose
+/// remaining swing fits in this many steps has nothing left that the value can show.
+const REST_STEPS: f32 = 16.0;
+
 impl Animated {
     /// A value at rest.
     pub const fn new(value: f32, spring: Spring) -> Self {
@@ -126,14 +135,46 @@ impl Animated {
             self.velocity = 0.0;
             return false;
         }
-        self.value = self.target + x;
+        let value = self.target + x;
+        if dt > 0.0 && value == self.value && x.abs() <= self.stall_distance(dt) {
+            // The step rounded back to the same value, close to the target: the spring is
+            // stalled there for good, so it lands instead of reporting motion forever.
+            self.value = self.target;
+            self.velocity = 0.0;
+            return false;
+        }
+        self.value = value;
         self.velocity = v;
         true
     }
 
-    /// `true` when the value sits at its target with negligible velocity.
+    /// `true` when the value sits at its target with negligible velocity, or as close to
+    /// it as an `f32` gets (within 16 float steps, at large values).
     pub fn is_at_rest(&self) -> bool {
-        (self.value - self.target).abs() < REST_EPSILON && self.velocity.abs() < REST_EPSILON
+        let offset = self.value - self.target;
+        if offset.abs() < REST_EPSILON && self.velocity.abs() < REST_EPSILON {
+            return true;
+        }
+        // How far the spring can still swing: its offset plus what its speed carries it.
+        // The offset alone rules out almost every moving frame, before the costlier part.
+        let limit = REST_STEPS * self.float_step();
+        offset.abs() <= limit && offset.hypot(self.velocity / self.spring.angular_frequency()) <= limit
+    }
+
+    /// Gap between the target and the next larger `f32`: the finest move the value can make.
+    fn float_step(&self) -> f32 {
+        self.target.abs().next_up() - self.target.abs()
+    }
+
+    /// Offset within which a step of `dt` can't move the value at all. Held at offset `x`,
+    /// a spring creeps toward the target at about `w0·x / 2ζ`; once that covers under half
+    /// a float step per frame, every step rounds back to the same value (the limit allows
+    /// a whole step, for margin). Slow and
+    /// over-damped springs stall there well beyond [`REST_STEPS`]. Frames under a
+    /// millisecond count as one, so a burst of tiny steps can't land a spring early.
+    fn stall_distance(&self, dt: f32) -> f32 {
+        let creep_per_offset = self.spring.angular_frequency() / (2.0 * self.spring.damping_ratio());
+        self.float_step() / (creep_per_offset * dt.max(1e-3))
     }
 }
 
@@ -184,6 +225,66 @@ mod tests {
             let a = settle(Spring::new(0.2, bounce), 40_000, 1.0 / 120.0);
             assert!(a.is_at_rest(), "bounce {bounce} left the value at {}", a.value);
         }
+    }
+
+    /// Steps until `step` reports rest, or `None` if it is still moving after `limit`.
+    fn steps_to_rest(a: &mut Animated, dt: f32, limit: usize) -> Option<usize> {
+        (1..=limit).find(|_| !a.step(dt))
+    }
+
+    #[test]
+    fn spring_to_a_large_target_comes_to_rest() {
+        // Past 1024 the value used to stop a float step short of the target while its speed
+        // stayed above REST_EPSILON, so it reported motion forever.
+        for spring in [Spring::SMOOTH, Spring::SNAPPY, Spring::BOUNCY, Spring::INTERACTIVE] {
+            for target in [1100.0, 2048.0, 5000.0, 1e5, 1e6, -3000.0] {
+                for dt in [1.0 / 240.0, 1.0 / 120.0, 1.0 / 60.0] {
+                    let mut a = Animated::new(0.0, spring);
+                    a.animate_to(target, spring);
+                    let steps = steps_to_rest(&mut a, dt, (3.0 / dt) as usize);
+                    assert!(steps.is_some(), "{spring:?} to {target} at {dt}: still moving at {} ({} short)", a.value, target - a.value);
+                    assert_eq!(a.value, target);
+                    assert!(a.is_at_rest());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_springs_at_large_values_come_to_rest() {
+        // A ringing spring jitters a float step either side of its target; a slow,
+        // over-damped one stalls tens of steps short at a high frame rate.
+        for spring in [Spring::new(0.05, 0.95), Spring::new(2.0, -0.95), Spring::new(1.0, 0.5)] {
+            for dt in [1.0 / 1000.0, 1.0 / 60.0] {
+                let mut a = Animated::new(0.0, spring);
+                a.animate_to(1e5, spring);
+                assert!(steps_to_rest(&mut a, dt, 200_000).is_some(), "{spring:?} at {dt} stuck at {}", a.value);
+                assert_eq!(a.value, 1e5);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_spring_at_a_large_target_keeps_moving() {
+        // Passing through the target at speed is motion, not rest.
+        let mut a = Animated { value: 1e6, velocity: 500.0, target: 1e6, spring: Spring::SNAPPY };
+        assert!(!a.is_at_rest());
+        assert!(a.step(1.0 / 120.0));
+        assert!(a.value > 1e6);
+    }
+
+    #[test]
+    fn tiny_steps_do_not_land_a_spring_early() {
+        // Steps too small to move the value must not read as a stall.
+        let mut a = Animated::new(0.0, Spring::SMOOTH);
+        a.animate_to(1000.0, Spring::SMOOTH);
+        while (a.target - a.value).abs() > 0.5 {
+            a.step(1.0 / 120.0);
+        }
+        let before = a.value;
+        assert!(a.step(0.0));
+        assert!(a.step(1e-7));
+        assert_eq!(a.value, before);
     }
 
     #[test]
