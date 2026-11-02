@@ -50,11 +50,7 @@ impl Color {
         let l = (0.412_221_46 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
         let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
         let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
-        [
-            0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
-            1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
-            0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
-        ]
+        [0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s, 1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s, 0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s]
     }
 }
 
@@ -190,7 +186,15 @@ impl Material {
     /// toward mid grey for legibility, light frost, crisp hairlines.
     pub const fn clear_bar() -> Self {
         let tone = Tone { lift: 0.0, luminance: 0.6, luminance_mix: 0.33, lighten: 0.0, darken_to: 1.0, darken: 0.0 };
-        Self { frost: 3.0, specular: 0.2, rim_shade: 0.0, hairline: 0.157, light_tone: tone, dark_tone: tone, ..Self::clear() }
+        Self {
+            frost: 3.0,
+            specular: 0.2,
+            rim_shade: 0.0,
+            hairline: 0.157,
+            light_tone: tone,
+            dark_tone: tone,
+            ..Self::clear()
+        }
     }
 
     /// `Glass.regular.tint(color)`: the primary action. `color.a` is the strength.
@@ -251,7 +255,14 @@ pub struct Appearance {
 
 impl Default for Appearance {
     fn default() -> Self {
-        Self { dark: false, transparency: 0.5, reduce_transparency: false, increase_contrast: false, reduce_motion: false, adapt_to_content: true }
+        Self {
+            dark: false,
+            transparency: 0.5,
+            reduce_transparency: false,
+            increase_contrast: false,
+            reduce_motion: false,
+            adapt_to_content: true,
+        }
     }
 }
 

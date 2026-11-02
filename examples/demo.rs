@@ -271,16 +271,8 @@ fn init_gpu(window: Arc<Window>, image: &image::RgbaImage) -> Gpu {
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        texture.as_image_copy(),
-        image.as_raw(),
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * image_size.0), rows_per_image: Some(image_size.1) },
-        texture.size(),
-    );
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("demo background"),
-        source: wgpu::ShaderSource::Wgsl(BACKGROUND_WGSL.into()),
-    });
+    queue.write_texture(texture.as_image_copy(), image.as_raw(), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * image_size.0), rows_per_image: Some(image_size.1) }, texture.size());
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("demo background"), source: wgpu::ShaderSource::Wgsl(BACKGROUND_WGSL.into()) });
     let background = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("demo background"),
         layout: None,

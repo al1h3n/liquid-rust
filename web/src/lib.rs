@@ -29,10 +29,7 @@ impl LiquidGlass {
         let (width, height) = (canvas.width(), canvas.height());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas)).map_err(|e| e.to_string())?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() })
-            .await
-            .map_err(|e| e.to_string())?;
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: Some(&surface), ..Default::default() }).await.map_err(|e| e.to_string())?;
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default()).await.map_err(|e| e.to_string())?;
         let mut config = surface.get_default_config(&adapter, width, height).ok_or("canvas not supported")?;
         // Canvases are bgra8unorm; draw through an sRGB view so shader output gets encoded.
@@ -65,7 +62,11 @@ impl LiquidGlass {
                 color_space: wgpu::PredefinedColorSpace::Srgb,
                 premultiplied_alpha: false,
             },
-            wgpu::Extent3d { width: background.width().min(width), height: background.height().min(height), depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: background.width().min(width),
+                height: background.height().min(height),
+                depth_or_array_layers: 1,
+            },
         );
         Ok(LiquidGlass {
             renderer: Renderer::new(&device, view_format),

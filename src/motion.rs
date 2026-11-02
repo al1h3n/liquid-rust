@@ -202,7 +202,12 @@ mod tests {
     fn bouncy_spring_overshoots() {
         let mut a = Animated::new(0.0, Spring::BOUNCY);
         a.animate_to(1.0, Spring::BOUNCY);
-        let peak = (0..120).map(|_| { a.step(1.0 / 120.0); a.value }).fold(0.0, f32::max);
+        let peak = (0..120)
+            .map(|_| {
+                a.step(1.0 / 120.0);
+                a.value
+            })
+            .fold(0.0, f32::max);
         assert!(peak > 1.02, "peak {peak}");
     }
 
@@ -210,7 +215,12 @@ mod tests {
     fn smooth_spring_never_overshoots() {
         let mut a = Animated::new(0.0, Spring::SMOOTH);
         a.animate_to(1.0, Spring::SMOOTH);
-        let peak = (0..240).map(|_| { a.step(1.0 / 120.0); a.value }).fold(0.0, f32::max);
+        let peak = (0..240)
+            .map(|_| {
+                a.step(1.0 / 120.0);
+                a.value
+            })
+            .fold(0.0, f32::max);
         assert!(peak <= 1.0 + 1e-4, "peak {peak}");
     }
 

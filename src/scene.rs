@@ -307,11 +307,7 @@ impl Scene {
             physics: true,
             glass_on_glass: true,
             light_angle: Animated::new(0.0, LIGHT_SWEEP),
-            touch: Touch {
-                pos: Vec2::ZERO,
-                intensity: Animated::new(0.0, GLOW_OUT),
-                radius: Animated::new(0.0, GLOW_SPREAD),
-            },
+            touch: Touch { pos: Vec2::ZERO, intensity: Animated::new(0.0, GLOW_OUT), radius: Animated::new(0.0, GLOW_SPREAD) },
             pressed: None,
             drag: None,
             next_order: 0,
@@ -587,17 +583,7 @@ impl Scene {
 
         let mut moving = false;
         for node in self.nodes.values_mut() {
-            for a in [
-                &mut node.x,
-                &mut node.y,
-                &mut node.w,
-                &mut node.h,
-                &mut node.presence,
-                &mut node.press,
-                &mut node.lift,
-                &mut node.stretch,
-                &mut node.morph,
-            ] {
+            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph] {
                 moving |= a.step(dt);
             }
         }

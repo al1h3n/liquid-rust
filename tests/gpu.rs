@@ -50,7 +50,10 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.target.as_image_copy(),
-            wgpu::TexelCopyBufferInfo { buffer: &readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * SIZE), rows_per_image: None } },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * SIZE), rows_per_image: None },
+            },
             self.target.size(),
         );
         self.queue.submit([encoder.finish()]);
@@ -248,10 +251,7 @@ fn cached_backdrop_draws_the_same_picture() {
     scene.set_frame(sheet, Rect::new(34.0, 4.0, 24.0, 24.0));
     for frame in 0..12 {
         scene.update(1.0 / 30.0);
-        let (Some(reused), Some(fresh)) = (
-            gpu.draw(&mut cached, &scene, (SIZE, SIZE), 2.0, frame == 0),
-            gpu.draw(&mut Renderer::new(&gpu.device, FORMAT), &scene, (SIZE, SIZE), 2.0, true),
-        ) else {
+        let (Some(reused), Some(fresh)) = (gpu.draw(&mut cached, &scene, (SIZE, SIZE), 2.0, frame == 0), gpu.draw(&mut Renderer::new(&gpu.device, FORMAT), &scene, (SIZE, SIZE), 2.0, true)) else {
             return;
         };
         assert!(difference(&reused, &fresh) <= 1, "frame {frame} differs from an uncached render");

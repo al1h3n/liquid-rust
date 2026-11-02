@@ -195,12 +195,7 @@ impl Offscreen {
         };
         let content = texture(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let target = texture(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
-        queue.write_texture(
-            content.as_image_copy(),
-            background.as_raw(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-            size,
-        );
+        queue.write_texture(content.as_image_copy(), background.as_raw(), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) }, size);
         Self {
             adapter: adapter.get_info().name,
             content: content.create_view(&Default::default()),

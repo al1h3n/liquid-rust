@@ -1,0 +1,4 @@
+# Matches the hand-formatted long-line style the code was written in.
+max_width = 200
+use_small_heuristics = "Max"
+struct_lit_width = 100

@@ -321,19 +321,8 @@ impl Pyramid {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let mips: Vec<_> = (0..levels)
-            .map(|i| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    base_mip_level: i,
-                    mip_level_count: Some(1),
-                    ..Default::default()
-                })
-            })
-            .collect();
-        let chain = mips[..mips.len() - 1]
-            .iter()
-            .map(|view| down_bind_group(device, &pipelines.down, &pipelines.sampler, view))
-            .collect();
+        let mips: Vec<_> = (0..levels).map(|i| texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: i, mip_level_count: Some(1), ..Default::default() })).collect();
+        let chain = mips[..mips.len() - 1].iter().map(|view| down_bind_group(device, &pipelines.down, &pipelines.sampler, view)).collect();
         Self { size, levels, full: texture.create_view(&wgpu::TextureViewDescriptor::default()), mips, chain }
     }
 
@@ -380,10 +369,7 @@ fn down_bind_group(device: &wgpu::Device, pipeline: &wgpu::RenderPipeline, sampl
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("liquid-rust downsample"),
         layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) },
-        ],
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) }],
     })
 }
 
@@ -438,16 +424,19 @@ fn storage(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     })
 }
 
-fn pipeline(device: &wgpu::Device, module: &wgpu::ShaderModule, vs: &str, fs: &str, format: wgpu::TextureFormat, blend: Option<wgpu::BlendState>, topology: wgpu::PrimitiveTopology) -> wgpu::RenderPipeline {
+fn pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    vs: &str,
+    fs: &str,
+    format: wgpu::TextureFormat,
+    blend: Option<wgpu::BlendState>,
+    topology: wgpu::PrimitiveTopology,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(fs),
         layout: None,
-        vertex: wgpu::VertexState {
-            module,
-            entry_point: Some(vs),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
+        vertex: wgpu::VertexState { module, entry_point: Some(vs), compilation_options: Default::default(), buffers: &[] },
         primitive: wgpu::PrimitiveState { topology, ..Default::default() },
         depth_stencil: None,
         multisample: Default::default(),
@@ -613,19 +602,9 @@ impl Renderer {
         let touch = &scene.touch;
         let globals = Globals {
             viewport: [w, h, 1.0 / w, 1.0 / h],
-            misc: [
-                frame.scale,
-                self.pyramid.as_ref().map_or(1, |p| p.levels) as f32,
-                if scene.appearance.dark { 0.0 } else { 1.0 },
-                0.0,
-            ],
+            misc: [frame.scale, self.pyramid.as_ref().map_or(1, |p| p.levels) as f32, if scene.appearance.dark { 0.0 } else { 1.0 }, 0.0],
             light: [angle.sin(), -angle.cos(), 0.0, 0.0],
-            touch: [
-                touch.pos.x * frame.scale,
-                touch.pos.y * frame.scale,
-                touch.radius.value.max(0.0) * frame.scale,
-                touch.intensity.value.max(0.0),
-            ],
+            touch: [touch.pos.x * frame.scale, touch.pos.y * frame.scale, touch.radius.value.max(0.0) * frame.scale, touch.intensity.value.max(0.0)],
         };
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
         write_storage(device, queue, &mut self.shapes, "liquid-rust shapes", &self.packed.shapes);
@@ -633,7 +612,17 @@ impl Renderer {
     }
 
     #[expect(clippy::too_many_arguments, reason = "plain pass recording, no state to bundle")]
-    fn draw_layer(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, layer: &Layer, src: &wgpu::TextureView, blur: &Pyramid, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
+    fn draw_layer(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &Layer,
+        src: &wgpu::TextureView,
+        blur: &Pyramid,
+        dst: &wgpu::TextureView,
+        region: Option<Bounds>,
+        size: (u32, u32),
+    ) {
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("liquid-rust glass"),
             layout: &self.pipelines.glass.get_bind_group_layout(0),
