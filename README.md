@@ -224,7 +224,10 @@ Where the cost goes:
 - One instanced quad per glass group. Every distance-field evaluation stays inside that quad,
   and the inner rim shadows are skipped deep inside large glass.
 - CPU work per frame is O(n) per container plus a buffer upload. Clustering is O(n²) within a
-  container, which is fine for tens of shapes.
+  container, which is fine for tens of shapes. Buffers are only written when their contents
+  change, and bind groups are kept across frames instead of being created every frame (a
+  JavaScript object each on the web). Recording a frame of the bench scene takes about 64 µs of
+  CPU, down from about 150 µs.
 - Glass on glass costs extra only where a higher layer overlaps lower glass.
 
 ### What is cached, and what never is

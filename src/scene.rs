@@ -757,6 +757,24 @@ mod tests {
     }
 
     #[test]
+    fn place_and_set_material_start_no_animation() {
+        // Instant moves (a window resize, a scrolled page) and material swaps (the transparency
+        // slider, a theme change) must not wake the spring loop: `update` stays `false`, so a
+        // host that redraws only while animating draws one frame and stops.
+        let mut scene = Scene::new();
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 40.0, 40.0)));
+        settle(&mut scene);
+        scene.set_material(id, Material::clear());
+        assert!(!scene.update(1.0 / 120.0), "set_material animates nothing");
+        // Mid-spring, `place` lands at once and drops the velocity it had.
+        scene.set_frame(id, Rect::new(200.0, 0.0, 80.0, 40.0));
+        scene.update(1.0 / 120.0);
+        scene.place(id, Rect::new(50.0, 60.0, 70.0, 30.0));
+        assert!(!scene.update(1.0 / 120.0), "place stops the spring it interrupted");
+        assert_eq!(scene.current_frame(id), Some(Rect::new(50.0, 60.0, 70.0, 30.0)));
+    }
+
+    #[test]
     fn glass_on_top_blocks_presses_below() {
         let mut scene = Scene::new();
         scene.add(Glass::new(Rect::new(0.0, 0.0, 100.0, 100.0)).interactive());

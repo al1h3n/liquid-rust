@@ -40,7 +40,7 @@ pub struct Frame<'a> {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct Globals {
     viewport: [f32; 4],
     misc: [f32; 4],
@@ -49,7 +49,7 @@ struct Globals {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct ShapeGpu {
     center_half: [f32; 4],
     params: [f32; 4],
@@ -58,7 +58,7 @@ struct ShapeGpu {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GroupGpu {
     bounds: [f32; 4],
     info: [u32; 4],
@@ -326,9 +326,9 @@ impl Pyramid {
         Self { size, levels, full: texture.create_view(&wgpu::TextureViewDescriptor::default()), mips, chain }
     }
 
-    /// Downsamples `src` into every level, only inside `region` (px of level 0).
-    fn build(&self, device: &wgpu::Device, pipelines: &Pipelines, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, region: Bounds) {
-        let first = down_bind_group(device, &pipelines.down_first, &pipelines.sampler, src);
+    /// Downsamples the texture `first` reads (see [`down_bind_group`]) into every level, only
+    /// inside `region` (px of level 0).
+    fn build(&self, pipelines: &Pipelines, encoder: &mut wgpu::CommandEncoder, first: &wgpu::BindGroup, region: Bounds) {
         for (i, mip) in self.mips.iter().enumerate() {
             let f = (1u32 << (i + 1)) as f32;
             let mip_size = ((self.size.0.div_ceil(2) >> i).max(1), (self.size.1.div_ceil(2) >> i).max(1));
@@ -346,7 +346,7 @@ impl Pyramid {
             }
             if i == 0 {
                 pass.set_pipeline(&pipelines.down_first);
-                pass.set_bind_group(0, &first, &[]);
+                pass.set_bind_group(0, first, &[]);
             } else {
                 pass.set_pipeline(&pipelines.down);
                 pass.set_bind_group(0, &self.chain[i - 1], &[]);
@@ -373,12 +373,16 @@ fn down_bind_group(device: &wgpu::Device, pipeline: &wgpu::RenderPipeline, sampl
     })
 }
 
-fn blit(device: &wgpu::Device, pipelines: &Pipelines, encoder: &mut wgpu::CommandEncoder, src: &wgpu::TextureView, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
-    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+fn blit_bind_group(device: &wgpu::Device, pipelines: &Pipelines, src: &wgpu::TextureView) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("liquid-rust blit"),
         layout: &pipelines.blit.get_bind_group_layout(0),
         entries: &[wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src) }],
-    });
+    })
+}
+
+/// Copies the texture `group` reads (see [`blit_bind_group`]) into `dst`.
+fn blit(pipelines: &Pipelines, encoder: &mut wgpu::CommandEncoder, group: &wgpu::BindGroup, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("liquid-rust blit"),
         color_attachments: &[Some(attachment(dst))],
@@ -393,8 +397,53 @@ fn blit(device: &wgpu::Device, pipelines: &Pipelines, encoder: &mut wgpu::Comman
         return;
     }
     pass.set_pipeline(&pipelines.blit);
-    pass.set_bind_group(0, &group, &[]);
+    pass.set_bind_group(0, group, &[]);
     pass.draw(0..3, 0..1);
+}
+
+/// Bind groups kept across frames, keyed by what they read. Making one is a driver call (and,
+/// on the web, a JavaScript object for the garbage collector), and its inputs (the content
+/// view, the two layer textures) rarely change between frames, so building them afresh every
+/// frame was pure overhead. A few entries cover every case; the oldest goes first, so a host
+/// that hands in a new view each frame keeps at most [`BindCache::CAPACITY`] alive.
+struct BindCache<K> {
+    entries: Vec<(K, wgpu::BindGroup)>,
+}
+
+impl<K: PartialEq> BindCache<K> {
+    const CAPACITY: usize = 4;
+
+    const fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// The bind group for `key`, made by `make` the first time.
+    fn get(&mut self, key: K, make: impl FnOnce(&K) -> wgpu::BindGroup) -> wgpu::BindGroup {
+        if let Some((_, group)) = self.entries.iter().find(|(k, _)| *k == key) {
+            return group.clone();
+        }
+        if self.entries.len() >= Self::CAPACITY {
+            self.entries.remove(0);
+        }
+        let group = make(&key);
+        self.entries.push((key, group.clone()));
+        group
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Every [`BindCache`] of a renderer.
+struct Binds {
+    /// Reads a texture for [`blit`].
+    blit: BindCache<wgpu::TextureView>,
+    /// Reads a texture into the first pyramid level.
+    down_first: BindCache<wgpu::TextureView>,
+    /// Glass pass: the backdrop it refracts, and whether it blurs from the layer pyramid.
+    /// Holds the storage buffers too, so it is cleared whenever they are reallocated.
+    glass: BindCache<(wgpu::TextureView, bool)>,
 }
 
 /// Draws [`Scene`]s with Liquid Glass. Create one per target format and reuse it.
@@ -413,6 +462,20 @@ pub struct Renderer {
     /// Region of `pyramid` that currently holds a valid blur of the content.
     cached: Option<Bounds>,
     packed: Packed,
+    /// What the GPU buffers hold now, so a frame where nothing moved uploads nothing.
+    uploaded: Uploaded,
+    binds: Binds,
+    /// Per layer: whether it needs a backdrop that includes the glass below it. Kept to reuse
+    /// its allocation.
+    rebuild: Vec<bool>,
+}
+
+/// Last contents written to the renderer's buffers.
+#[derive(Default)]
+struct Uploaded {
+    globals: Option<Globals>,
+    shapes: Vec<ShapeGpu>,
+    groups: Vec<GroupGpu>,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
@@ -492,6 +555,9 @@ impl Renderer {
             layer_textures: Vec::new(),
             cached: None,
             packed: Packed::default(),
+            uploaded: Uploaded::default(),
+            binds: Binds { blit: BindCache::new(), down_first: BindCache::new(), glass: BindCache::new() },
+            rebuild: Vec::new(),
         }
     }
 
@@ -539,9 +605,15 @@ impl Renderer {
             self.layered = None;
             self.layer_textures.clear();
             self.cached = None;
+            // Old layer textures and pyramids: their bind groups would keep them alive.
+            self.binds.blit.clear();
+            self.binds.down_first.clear();
+            self.binds.glass.clear();
         }
         self.upload(device, queue, frame, scene);
-        blit(device, &self.pipelines, encoder, frame.content, frame.target, None, size);
+        let pipelines = &self.pipelines;
+        let copy = self.binds.blit.get(frame.content.clone(), |src| blit_bind_group(device, pipelines, src));
+        blit(pipelines, encoder, &copy, frame.target, None, size);
         if self.packed.layers.is_empty() {
             return;
         }
@@ -551,7 +623,9 @@ impl Renderer {
         let reach = self.packed.reach;
         let layers = &self.packed.layers;
         let tail = |i: usize| clamp_bounds(expand(layers[i..].iter().fold(layers[i].bounds, |a, l| union(a, l.bounds)), reach), screen);
-        let mut rebuild = vec![false; layers.len()];
+        let rebuild = &mut self.rebuild;
+        rebuild.clear();
+        rebuild.resize(layers.len(), false);
         let mut below = layers[0].bounds;
         for (i, layer) in layers.iter().enumerate().skip(1) {
             rebuild[i] = scene.glass_on_glass && intersects(expand(layer.bounds, reach), below);
@@ -563,18 +637,41 @@ impl Renderer {
         }
 
         let Some(pyramid) = &self.pyramid else { return };
+        let pipelines = &self.pipelines;
+        let binds = &mut self.binds;
         let region = tail(0);
         if frame.content_changed || !self.cached.is_some_and(|c| contains(c, region)) {
             // Content that holds still is blurred across the whole screen, once: the glass
             // can then move anywhere over it without another build.
             let region = if frame.content_changed { region } else { screen };
-            pyramid.build(device, &self.pipelines, encoder, frame.content, region);
+            let first = binds.down_first.get(frame.content.clone(), |src| down_bind_group(device, &pipelines.down_first, &pipelines.sampler, src));
+            pyramid.build(pipelines, encoder, &first, region);
             self.cached = Some(region);
         }
 
-        // `src` is the backdrop the next layer refracts, `blur` its pyramid, and `baked` the
-        // number of layers already drawn into it.
-        let (mut src, mut blur, mut baked, mut slot) = (frame.content, pyramid, 0, 0);
+        // Glass pass inputs: the shared buffers, the backdrop `src` and its blur pyramid.
+        let (globals, shapes, groups) = (&self.globals, &self.shapes, &self.groups);
+        let mut glass_group = |src: &wgpu::TextureView, blur: &Pyramid, layered: bool| {
+            binds.glass.get((src.clone(), layered), |(src, _)| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("liquid-rust glass"),
+                    layout: &pipelines.glass.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: shapes.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: groups.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(src) },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&blur.full) },
+                    ],
+                })
+            })
+        };
+
+        // `src` is the backdrop the next layer refracts, `group` the glass bind group reading
+        // it and its blur, and `baked` the number of layers already drawn into it.
+        let mut group = glass_group(frame.content, pyramid, false);
+        let (mut src, mut baked, mut slot) = (frame.content, 0, 0);
         for (i, layer) in layers.iter().enumerate() {
             if let (true, Some(layered)) = (rebuild[i], &self.layered) {
                 let region = tail(i);
@@ -582,17 +679,20 @@ impl Renderer {
                 // needs no rebuild, the index would read and write the same texture.
                 let dst = &self.layer_textures[slot];
                 slot ^= 1;
-                blit(device, &self.pipelines, encoder, src, dst, Some(region), size);
+                let copy = binds.blit.get(src.clone(), |src| blit_bind_group(device, pipelines, src));
+                blit(pipelines, encoder, &copy, dst, Some(region), size);
                 // Every layer since the last rebuild, not just the one below: all of them
                 // are under this layer.
                 for lower in &layers[baked..i] {
-                    self.draw_layer(device, encoder, lower, src, blur, dst, Some(region), size);
+                    draw_layer(pipelines, encoder, &group, lower, dst, Some(region), size);
                 }
                 // A pyramid of its own, so the blur of the content stays cached.
-                layered.build(device, &self.pipelines, encoder, dst, region);
-                (src, blur, baked) = (dst, layered, i);
+                let first = binds.down_first.get(dst.clone(), |src| down_bind_group(device, &pipelines.down_first, &pipelines.sampler, src));
+                layered.build(pipelines, encoder, &first, region);
+                group = glass_group(dst, layered, true);
+                (src, baked) = (dst, i);
             }
-            self.draw_layer(device, encoder, layer, src, blur, frame.target, None, size);
+            draw_layer(pipelines, encoder, &group, layer, frame.target, None, size);
         }
     }
 
@@ -606,52 +706,39 @@ impl Renderer {
             light: [angle.sin(), -angle.cos(), 0.0, 0.0],
             touch: [touch.pos.x * frame.scale, touch.pos.y * frame.scale, touch.radius.value.max(0.0) * frame.scale, touch.intensity.value.max(0.0)],
         };
-        queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
-        write_storage(device, queue, &mut self.shapes, "liquid-rust shapes", &self.packed.shapes);
-        write_storage(device, queue, &mut self.groups, "liquid-rust groups", &self.packed.groups);
-    }
-
-    #[expect(clippy::too_many_arguments, reason = "plain pass recording, no state to bundle")]
-    fn draw_layer(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        layer: &Layer,
-        src: &wgpu::TextureView,
-        blur: &Pyramid,
-        dst: &wgpu::TextureView,
-        region: Option<Bounds>,
-        size: (u32, u32),
-    ) {
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("liquid-rust glass"),
-            layout: &self.pipelines.glass.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.shapes.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: self.groups.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.pipelines.sampler) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&blur.full) },
-            ],
-        });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("liquid-rust glass"),
-            color_attachments: &[Some(attachment(dst))],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if let Some(region) = region
-            && !scissor(&mut pass, region, size)
-        {
-            return;
+        // Rendering again with nothing moved (only the content changed, or the host redrew)
+        // uploads nothing.
+        if self.uploaded.globals != Some(globals) {
+            queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+            self.uploaded.globals = Some(globals);
         }
-        pass.set_pipeline(&self.pipelines.glass);
-        pass.set_bind_group(0, &group, &[]);
-        pass.draw(0..4, layer.groups.clone());
+        let grown = write_storage(device, queue, &mut self.shapes, "liquid-rust shapes", &self.packed.shapes, &mut self.uploaded.shapes)
+            | write_storage(device, queue, &mut self.groups, "liquid-rust groups", &self.packed.groups, &mut self.uploaded.groups);
+        if grown {
+            // The glass bind groups point at the old buffers.
+            self.binds.glass.clear();
+        }
     }
+}
+
+/// Draws the glass groups of `layer` with the glass bind group `group` into `dst`.
+fn draw_layer(pipelines: &Pipelines, encoder: &mut wgpu::CommandEncoder, group: &wgpu::BindGroup, layer: &Layer, dst: &wgpu::TextureView, region: Option<Bounds>, size: (u32, u32)) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("liquid-rust glass"),
+        color_attachments: &[Some(attachment(dst))],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    if let Some(region) = region
+        && !scissor(&mut pass, region, size)
+    {
+        return;
+    }
+    pass.set_pipeline(&pipelines.glass);
+    pass.set_bind_group(0, group, &[]);
+    pass.draw(0..4, layer.groups.clone());
 }
 
 fn layer_texture(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> wgpu::TextureView {
@@ -669,14 +756,22 @@ fn layer_texture(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32,
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn write_storage<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &mut wgpu::Buffer, label: &str, data: &[T]) {
+/// Writes `data` into `buffer` unless it already holds exactly that (`last`), growing it to
+/// fit first. Returns `true` when the buffer was reallocated.
+fn write_storage<T: Pod + PartialEq>(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &mut wgpu::Buffer, label: &str, data: &[T], last: &mut Vec<T>) -> bool {
     let bytes: &[u8] = bytemuck::cast_slice(data);
-    if bytes.len() as u64 > buffer.size() {
+    let grown = bytes.len() as u64 > buffer.size();
+    if grown {
         *buffer = storage(device, label, (bytes.len() as u64).next_power_of_two());
     }
-    if !bytes.is_empty() {
-        queue.write_buffer(buffer, 0, bytes);
+    if grown || data != last.as_slice() {
+        if !bytes.is_empty() {
+            queue.write_buffer(buffer, 0, bytes);
+        }
+        last.clear();
+        last.extend_from_slice(data);
     }
+    grown
 }
 
 #[cfg(test)]

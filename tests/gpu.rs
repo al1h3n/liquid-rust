@@ -259,6 +259,31 @@ fn cached_backdrop_draws_the_same_picture() {
 }
 
 #[test]
+fn reused_renderer_survives_growing_buffers_and_idle_frames() {
+    // The renderer keeps its bind groups and skips uploads that would change nothing. Adding
+    // glass past its first buffer size reallocates the buffers (stale bind groups would draw
+    // the old ones), and frames where nothing moved upload nothing: both must still match a
+    // fresh renderer.
+    let mut scene = Scene::new();
+    scene.add(Glass::new(Rect::new(4.0, 4.0, 20.0, 20.0)));
+    scene.add(Glass::new(Rect::new(10.0, 10.0, 30.0, 30.0)).z(1));
+    settle(&mut scene);
+    let Some(gpu) = Gpu::new(&stripes()) else { return };
+    let mut reused = Renderer::new(&gpu.device, FORMAT);
+    gpu.draw(&mut reused, &scene, (SIZE, SIZE), 2.0, true);
+    for i in 0..40 {
+        scene.add(Glass::new(Rect::new(2.0 + (i % 8) as f32 * 7.5, 34.0 + (i / 8) as f32 * 6.0, 6.0, 5.0)).material(bare()));
+    }
+    settle(&mut scene);
+    for (frame, content_changed) in [(0, false), (1, false), (2, true)] {
+        let (Some(a), Some(b)) = (gpu.draw(&mut reused, &scene, (SIZE, SIZE), 2.0, content_changed), gpu.draw(&mut Renderer::new(&gpu.device, FORMAT), &scene, (SIZE, SIZE), 2.0, true)) else {
+            return;
+        };
+        assert!(difference(&a, &b) <= 1, "frame {frame} differs from a fresh renderer");
+    }
+}
+
+#[test]
 fn layers_drawn_in_two_passes_match_one() {
     // The lower layer goes into a texture that becomes the content of the upper one, which
     // is how a host puts labels between layers. With no labels the picture must not change.
