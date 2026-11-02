@@ -19,8 +19,10 @@ lock-screen button and the dock match the kit's render pixel profile for pixel p
   reproduced exactly, in sRGB-encoded space.
 - **Light.** A crisp lit rim line that takes its colour from what is behind it. Inner rim
   shadows match the kit's `#282828` dodge and `#E6E6E6` burn. iOS 27's darkened hairline edge.
-- **Adaptive.** Small regular glass flips between light and dark with the content behind it.
-  Large glass gets thicker: more frost, a deeper shadow, a more opaque face. The shadow
+- **Adaptive.** Small regular glass (buttons, tab bars) flips between light and dark with the
+  content behind it; from about 180 pt (menus, panels) glass follows the colour scheme. It
+  always takes one face or the other, never a grey half-and-half blend. Large glass gets
+  thicker: more frost, a deeper shadow, a more opaque face. The shadow
   strengthens over busy content and fades over flat light content.
 - **Liquid.** Glass in one container is drawn as a single smooth-union distance field, so
   shapes grow a liquid neck and fuse as they approach, then split apart. This comes from the
@@ -135,6 +137,48 @@ scene.collapse_into(results, bar, Spring::new(0.35, 0.0));
 
 Every field maps to a knob in Figma's GLASS panel (`refraction`, `depth`, `dispersion`,
 `frost`, `splay`, `specular`) or to an Apple kit fill/shadow. You can copy values straight from a design.
+
+### Transparency slider
+
+`scene.appearance.transparency` is iOS 27's Liquid Glass slider: `0` ultra clear, `0.5` the
+default (the kit's values), `1` fully tinted. Since 0.2.4 the tinted half follows Apple's iOS 27
+screenshots (menus, dark Home Screen widgets, Clear vs Tinted):
+
+- **Dark glass goes near-black.** The dark face's DARKEN fill moves to `#1C1C1E` and its opacity
+  rises toward 70–85 % (`darken` 0.25 → 0.70 for a button, 0.52 → 0.81 for a panel).
+- **Light glass goes white.** The light face's white LIGHTEN fill rises toward 70–88 %
+  (`lighten` 0.20 → 0.68 for a button, 0.75 → 0.88 for a panel).
+- **Nothing is pulled toward mid grey.** Before 0.2.4 the slider raised the luminosity fill
+  (`luminance_mix` 0.2 → 0.48), whitened the dark face (`lighten` 0 → 0.25) and capped the light
+  face at a 75 % grey (`darken` 0.1 → 0.42). Together they turned tinted glass flat grey. Those
+  values now stay where the default has them.
+- Both faces keep a trace of the backdrop's colour (dark tinted glass keeps at least 40 % of its
+  saturation), and the bevel, rims, specular and outer edge keep their boost, so edges still
+  bend. Frost grows by at most √2.
+- Clear glass tints the same way, by the colour scheme: dark in the dark scheme, white frost in
+  the light one (it used to whiten in both).
+- Reduce Transparency uses the same tinted faces, plus heavy frost.
+- Apps that capped `transparency` at 0.5, or darkened and whitened their own panes to hide the
+  grey, can drop that workaround.
+
+Measured on square regular panels over a flat `#2261D9` blue: WCAG luminance of the face at
+the default → fully tinted, with the share of the backdrop's saturation kept when tinted.
+
+| panel | before 0.2.4 | now |
+|---|---|---|
+| 120 pt, dark scheme | 0.18 → 0.20 (36 %): *lighter* and greyer | 0.065 → 0.026 (82 %) |
+| 240 pt, dark scheme | 0.061 → 0.048 (59 %) | 0.035 → 0.020 (75 %) |
+| 120 pt, light scheme | 0.24 → 0.31 | 0.44 → 0.72 |
+| 240 pt, light scheme | 0.53 → 0.58 | 0.69 → 0.84 |
+
+Over a white page, a 400 pt panel in the dark scheme now goes from 0.14 to 0.048
+(about `#3D3D3D`, close to `#1C1C1E` at 80 % over white). The defaults changed too, because
+120 pt and larger glass no longer blends its two faces.
+
+Large light glass also whitens more at the default (`lighten` +0.55 and `luminance_mix` +0.15
+at full thickness, up from +0.5 and +0). Black text on a light 180 pt panel over a dark, busy
+wallpaper went from 6.9:1 to 11.9:1 contrast (WCAG), and a 260 pt panel from 11.3:1 to 14.5:1.
+Clear glass keeps its kit values at the default.
 
 ## Examples
 

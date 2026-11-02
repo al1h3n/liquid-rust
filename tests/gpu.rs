@@ -293,3 +293,70 @@ fn empty_frame_is_skipped() {
         gpu.draw(&mut renderer, &scene, size, 2.0, true);
     }
 }
+
+// ---------------------------------------------------------------- slider and faces
+
+/// Flat backdrop of one sRGB colour.
+fn solid(rgb: [u8; 3]) -> Vec<u8> {
+    (0..SIZE * SIZE).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect()
+}
+
+/// Average WCAG luminance and HSV saturation of the 16 x 16 px square in the middle.
+fn centre(data: &[u8]) -> (f32, f32) {
+    let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+    let (mut lum, mut sat) = (0.0, 0.0);
+    for y in SIZE / 2 - 8..SIZE / 2 + 8 {
+        for x in SIZE / 2 - 8..SIZE / 2 + 8 {
+            let c = pixel(data, x, y).iter().take(3).map(|&v| f32::from(v) / 255.0).collect::<Vec<_>>();
+            let (hi, lo) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+            lum += 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+            sat += if hi > 0.0 { (hi - lo) / hi } else { 0.0 };
+        }
+    }
+    (lum / 256.0, sat / 256.0)
+}
+
+/// A square regular panel `side` points wide, centred in a 256 pt frame (half a pixel per
+/// point), at the given slider position and scheme.
+fn panel(transparency: f32, dark: bool, side: f32, backdrop: &[u8]) -> Option<(f32, f32)> {
+    let mut scene = Scene::new();
+    scene.appearance.transparency = transparency;
+    scene.appearance.dark = dark;
+    let o = (256.0 - side) / 2.0;
+    scene.add(Glass::new(Rect::new(o, o, side, side)).shape(Shape::Rounded(30.0)));
+    settle(&mut scene);
+    render_at(&scene, backdrop, 0.5).map(|frame| centre(&frame))
+}
+
+#[test]
+fn fully_tinted_dark_glass_darkens_and_keeps_the_backdrop_colour() {
+    // A small panel too: the old slider greyed it the most.
+    for (rgb, side) in [([34, 97, 217], 120.0), ([34, 97, 217], 240.0), ([30, 140, 70], 120.0), ([242, 128, 26], 240.0)] {
+        let backdrop = solid(rgb);
+        let Some((default, _)) = panel(0.5, true, side, &backdrop) else { return };
+        let (tinted, sat) = panel(1.0, true, side, &backdrop).unwrap();
+        let (_, backdrop_sat) = centre(&backdrop);
+        assert!(tinted < default, "{rgb:?} {side} pt: tinted {tinted} vs default {default}");
+        assert!(sat >= 0.4 * backdrop_sat, "{rgb:?} {side} pt: saturation {sat} of {backdrop_sat}: grey, not tinted");
+    }
+}
+
+#[test]
+fn fully_tinted_light_glass_whitens() {
+    let backdrop = solid([34, 97, 217]);
+    let Some((default, _)) = panel(0.5, false, 240.0, &backdrop) else { return };
+    let (tinted, _) = panel(1.0, false, 240.0, &backdrop).unwrap();
+    assert!(tinted > default && tinted > 0.7, "tinted {tinted} vs default {default}");
+}
+
+#[test]
+fn a_panel_takes_the_scheme_face_instead_of_a_grey_blend() {
+    // A 200 pt panel in the dark scheme over a white page used to blend its dark and light
+    // faces half and half: flat grey. It now stays dark, and stays light in the light scheme.
+    let white = solid([248, 248, 248]);
+    let Some((dark, _)) = panel(0.5, true, 200.0, &white) else { return };
+    assert!(dark < 0.25, "dark panel over white: luminance {dark}");
+    let night = solid([20, 24, 40]);
+    let (light, _) = panel(0.5, false, 200.0, &night).unwrap();
+    assert!(light > 0.45, "light panel over a dark backdrop: luminance {light}");
+}

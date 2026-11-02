@@ -382,8 +382,15 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
     var g = encode(col);
     let top = max(globals.misc.y - 1.0, 0.0);
     let bg = luminance(encode(textureSampleLevel(pyr, samp, center_uv, top).rgb));
-    // Biased toward light: small glass only turns dark over genuinely dark content.
-    let lightness = mix(globals.misc.z, smoothstep(0.26, 0.46, bg), grp.geo.w);
+    // Small glass (adaptivity 1) flips at a backdrop of ~0.36, biased toward light: it only
+    // turns dark over genuinely dark content. Larger glass needs ever more contrasting content
+    // to flip, until (adaptivity 0) it never does and follows the scheme. Moving the threshold,
+    // rather than blending scheme and content by adaptivity, keeps the face fully light or
+    // fully dark: a 50/50 blend of the two faces is the flat grey Apple's glass never shows.
+    let scheme_edge = select(1.2, -0.2, globals.misc.z > 0.5);
+    let flip = mix(scheme_edge, 0.36, grp.geo.w);
+    // Narrow, so content only briefly sits in between, where the faces blend toward grey.
+    let lightness = smoothstep(flip - 0.06, flip + 0.06, bg);
     g = mix(tone(g, grp.dark_a, grp.dark_b), tone(g, grp.light_a, grp.light_b), lightness);
 
     // Stained-glass tint: keep hue and chroma, let lightness follow the backdrop.

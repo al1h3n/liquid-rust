@@ -289,6 +289,31 @@ fn more_opaque(amount: f32, k: f32) -> f32 {
     if k >= 0.0 { amount + (1.0 - amount) * k } else { amount * (1.0 + k) }
 }
 
+/// Grey Apple's tinted dark glass settles on: `systemGray6` dark, `#1C1C1E`.
+pub(crate) const NEAR_BLACK: f32 = 0x1C as f32 / 255.0;
+
+/// Opacity the slider's "fully tinted" end gives each face, measured from Apple's iOS 27
+/// screenshots (menus, dark Home Screen widgets, Clear vs Tinted): dark glass about 70–85 %
+/// `#1C1C1E`, light glass about 70–80 % white frost.
+const TINTED_DARKEN: f32 = 0.6;
+const TINTED_LIGHTEN: f32 = 0.6;
+/// Neither face goes fully opaque: a trace of the backdrop's colour always shows through.
+const TINTED_MAX: f32 = 0.88;
+
+/// Moves both faces toward Apple's "tinted" glass by `k` (`0..=1`): the dark face darkens
+/// toward near-black `#1C1C1E`, the light face whitens. Neither is pulled toward a mid
+/// luminance, which is what used to make tinted glass read flat grey: the luminosity fill,
+/// the dark face's white and the light face's grey cap stay exactly as they were.
+fn tint_faces(m: &mut Material, k: f32) {
+    let dark = &mut m.dark_tone;
+    // A DARKEN fill with #1C1C1E is Apple's normal-blended near-black for everything brighter
+    // than it, and leaves darker content alone instead of lifting it to grey.
+    dark.darken_to += (NEAR_BLACK - dark.darken_to) * k;
+    dark.darken = more_opaque(dark.darken, TINTED_DARKEN * k).min(TINTED_MAX.max(dark.darken));
+    let light = &mut m.light_tone;
+    light.lighten = more_opaque(light.lighten, TINTED_LIGHTEN * k).min(TINTED_MAX.max(light.lighten));
+}
+
 impl Material {
     /// Adapts the material to an element whose smaller side is `min_side` points.
     pub(crate) fn resolve(&self, min_side: f32, appearance: &Appearance) -> Resolved {
@@ -303,37 +328,40 @@ impl Material {
             m.specular -= 0.05 * tau;
             m.shadow.blur += 33.0 * tau;
             m.shadow.opacity += 0.19 * tau;
-            m.light_tone.lighten += 0.5 * tau;
+            // Large light glass reads as white frost, so dark text on it stays legible even
+            // over a dark, busy backdrop; the luminosity fill grows with it so the face
+            // whitens instead of washing toward a flat grey.
+            m.light_tone.lighten += 0.55 * tau;
+            m.light_tone.luminance_mix += 0.15 * tau;
             m.dark_tone.darken += 0.27 * tau;
             if appearance.adapt_to_content {
-                adapt = 1.0 - tau;
+                // Only small glass (tab bars, buttons) flips with the content; from about
+                // 180 pt (menus, panels, sidebars) glass follows the colour scheme.
+                adapt = 1.0 - smoothstep(0.0, 0.5, tau);
             }
         }
 
-        let mut k = (appearance.transparency.clamp(0.0, 1.0) - 0.5) * 2.0;
+        let k = (appearance.transparency.clamp(0.0, 1.0) - 0.5) * 2.0;
         if appearance.reduce_transparency {
-            k = 1.0;
-            m.frost = (m.frost * 3.0).max(20.0);
-        }
-        if k > 0.0 && !appearance.reduce_transparency {
+            // Frostier and as opaque as fully tinted, without the stronger rims.
+            m.frost = (m.frost * 3.0).max(20.0) * 1.1f32.exp2();
+            tint_faces(&mut m, 1.0);
+        } else if k > 0.0 {
             // Toward "fully tinted" (iOS 26.1: "increases opacity and adds more contrast"): a
             // more opaque face and stronger rims, but frost grows only a little, so the bevel
             // still visibly bends the content behind it.
             m.frost *= (0.5 * k).exp2();
-            for tone in [&mut m.light_tone, &mut m.dark_tone] {
-                tone.luminance_mix = more_opaque(tone.luminance_mix, 0.35 * k);
-                tone.lighten = more_opaque(tone.lighten, 0.25 * k).min(0.85);
-                tone.darken = more_opaque(tone.darken, 0.35 * k).min(0.85);
-            }
+            tint_faces(&mut m, k);
             m.edge = (m.edge + 0.25 * k).min(1.0);
             m.rim += 0.08 * k;
             m.specular += 0.08 * k;
         } else {
+            // Toward "ultra clear": less frost and every fill fades.
             m.frost *= (1.1 * k).exp2();
             for tone in [&mut m.light_tone, &mut m.dark_tone] {
                 tone.luminance_mix = more_opaque(tone.luminance_mix, 0.45 * k);
-                tone.lighten = more_opaque(tone.lighten, 0.35 * k).min(0.9);
-                tone.darken = more_opaque(tone.darken, 0.45 * k).min(0.9);
+                tone.lighten = more_opaque(tone.lighten, 0.35 * k);
+                tone.darken = more_opaque(tone.darken, 0.45 * k);
             }
         }
 
@@ -378,6 +406,122 @@ mod tests {
         assert!(r.light_tone.lighten > Material::regular().light_tone.lighten);
     }
 
+    // ------------------------------------------------ tone checks without a GPU
+
+    /// CPU copy of `tone()` in glass.wgsl (sRGB-encoded space): lift, LUMINOSITY fill, white
+    /// LIGHTEN fill, grey DARKEN fill. Keep the two in step; `tests/gpu.rs` checks the shader.
+    fn tone(c: [f32; 3], t: &Tone) -> [f32; 3] {
+        let blend_lum = |c: [f32; 3]| 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+        let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        let x = c.map(|v| (v + t.lift).min(1.0));
+        // W3C SetLum with ClipColor (Figma's LUMINOSITY blend).
+        let d = t.luminance - blend_lum(x);
+        let mut s = x.map(|v| v + d);
+        let (l, lo, hi) = (blend_lum(s), s[0].min(s[1]).min(s[2]), s[0].max(s[1]).max(s[2]));
+        if lo < 0.0 {
+            s = s.map(|v| l + (v - l) * l / (l - lo).max(1e-5));
+        }
+        if hi > 1.0 {
+            s = s.map(|v| l + (v - l) * (1.0 - l) / (hi - l).max(1e-5));
+        }
+        [0, 1, 2].map(|i| {
+            let v = mix(x[i], s[i], t.luminance_mix);
+            let v = mix(v, 1.0, t.lighten);
+            mix(v, v.min(t.darken_to), t.darken)
+        })
+    }
+
+    /// WCAG relative luminance of an sRGB colour.
+    fn luminance(c: [f32; 3]) -> f32 {
+        let lin = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2])
+    }
+
+    /// HSV saturation.
+    fn saturation(c: [f32; 3]) -> f32 {
+        let (hi, lo) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        if hi > 0.0 { (hi - lo) / hi } else { 0.0 }
+    }
+
+    /// Saturated backdrops (already frosted, so flat): blue, orange, green, magenta, and a
+    /// dark busy wallpaper's average.
+    const BACKDROPS: [[f32; 3]; 5] = [[0.13, 0.38, 0.85], [0.95, 0.5, 0.1], [0.2, 0.75, 0.35], [0.8, 0.2, 0.6], [0.25, 0.2, 0.35]];
+
+    fn faces(min_side: f32, transparency: f32) -> (Tone, Tone) {
+        let m = Material::regular().resolve(min_side, &Appearance { transparency, ..Appearance::default() }).material;
+        (m.dark_tone, m.light_tone)
+    }
+
+    #[test]
+    fn fully_tinted_dark_glass_is_near_black_not_grey() {
+        for side in [44.0, 180.0, 400.0] {
+            let ((default, _), (tinted, _)) = (faces(side, 0.5), faces(side, 1.0));
+            for c in BACKDROPS {
+                let (before, after) = (tone(c, &default), tone(c, &tinted));
+                // Darker than the default, except over content so dark that the default already
+                // went below Apple's #1C1C1E: tinted glass settles on that grey, not on black.
+                let floor = 1.5 * luminance([NEAR_BLACK; 3]);
+                assert!(luminance(after) < luminance(before).max(floor), "{side} pt over {c:?}: darker than the default");
+                // Apple: about 70-85 % #1C1C1E, so at most ~30 % of the backdrop's light.
+                assert!(luminance(after) < 0.3 * luminance(c).max(0.05) + luminance([NEAR_BLACK; 3]), "{side} pt over {c:?}: {after:?}");
+                let kept = saturation(after) / saturation(c);
+                assert!(kept >= 0.4, "{side} pt over {c:?}: keeps only {:.0} % of the colour", kept * 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn fully_tinted_light_glass_is_white_frost() {
+        for side in [44.0, 180.0, 400.0] {
+            let ((_, default), (_, tinted)) = (faces(side, 0.5), faces(side, 1.0));
+            for c in BACKDROPS.into_iter().chain([[0.97; 3]]) {
+                let (before, after) = (tone(c, &default), tone(c, &tinted));
+                assert!(luminance(after) >= luminance(before), "{side} pt over {c:?}: lighter than the default");
+                assert!(after.iter().all(|&v| v > 0.7), "{side} pt over {c:?}: white frost, got {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fully_tinted_never_pulls_toward_mid_grey() {
+        // The old slider raised the luminosity fill (toward a mid luminance), whitened the dark
+        // face and capped the light face at a 75 % grey: all three read as flat grey.
+        for side in [44.0, 180.0, 400.0] {
+            let ((dark, light), (dark_t, light_t)) = (faces(side, 0.5), faces(side, 1.0));
+            assert!(dark_t.luminance_mix <= dark.luminance_mix && light_t.luminance_mix <= light.luminance_mix);
+            assert!(dark_t.lighten <= dark.lighten && light_t.darken <= light.darken);
+            assert_eq!(dark_t.darken_to, NEAR_BLACK);
+        }
+    }
+
+    #[test]
+    fn large_light_glass_keeps_dark_text_legible_over_dark_busy_content() {
+        // Frosted dark wallpaper: deep blue, near-black and a dim red, at the default slider.
+        let (_, light) = faces(260.0, 0.5);
+        for c in [[0.05, 0.08, 0.2], [0.02, 0.02, 0.02], [0.35, 0.1, 0.1], [0.25, 0.2, 0.35]] {
+            let face = tone(c, &light);
+            // Black label: WCAG AAA (7:1).
+            let contrast = (luminance(face) + 0.05) / 0.05;
+            assert!(contrast >= 7.0, "over {c:?}: {face:?} gives {contrast:.1}:1");
+        }
+    }
+
+    #[test]
+    fn clear_glass_stays_clear_at_the_default() {
+        for side in [44.0, 400.0] {
+            let m = Material::clear().resolve(side, &Appearance::default()).material;
+            assert_eq!((m.light_tone, m.dark_tone), (Material::clear().light_tone, Material::clear().dark_tone));
+        }
+    }
+
+    #[test]
+    fn reduce_transparency_is_opaque_without_greying() {
+        let a = Appearance { reduce_transparency: true, dark: true, ..Appearance::default() };
+        let m = Material::regular().resolve(400.0, &a).material;
+        let c = BACKDROPS[0];
+        assert!(luminance(tone(c, &m.dark_tone)) < 0.05 && tone(c, &m.light_tone).iter().all(|&v| v > 0.8));
+    }
+
     #[test]
     fn fully_tinted_keeps_the_bevel_visible() {
         // The refraction must still read: frost grows by at most √2 and refraction is untouched,
@@ -394,6 +538,15 @@ mod tests {
     fn small_glass_follows_the_scheme_when_not_adapting_to_content() {
         let a = Appearance { adapt_to_content: false, ..Appearance::default() };
         assert_eq!(Material::regular().resolve(44.0, &a).adapt, 0.0);
+    }
+
+    #[test]
+    fn only_small_glass_flips_with_the_content() {
+        let a = Appearance::default();
+        let adapt = |side: f32| Material::regular().resolve(side, &a).adapt;
+        assert_eq!(adapt(44.0), 1.0, "a button flips");
+        assert!(adapt(120.0) > 0.0 && adapt(120.0) < 1.0);
+        assert_eq!(adapt(190.0), 0.0, "a menu or panel follows the scheme");
     }
 
     #[test]
