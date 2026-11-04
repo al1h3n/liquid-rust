@@ -232,6 +232,51 @@ impl Material {
     pub(crate) fn is_identity(&self) -> bool {
         *self == Self::identity()
     }
+
+    /// `self` at `t = 0`, `to` at `t = 1`, every knob in between (`t` is clamped, so a
+    /// spring's overshoot never extrapolates). A tint only one side has fades in or out by
+    /// its strength, instead of passing through black.
+    pub(crate) fn lerp(&self, to: &Self, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        // This form is exact at both ends (`a + (b - a) * t` isn't at `t = 1`).
+        let f = |a: f32, b: f32| a * (1.0 - t) + b * t;
+        let tone = |a: Tone, b: Tone| Tone {
+            lift: f(a.lift, b.lift),
+            luminance: f(a.luminance, b.luminance),
+            luminance_mix: f(a.luminance_mix, b.luminance_mix),
+            lighten: f(a.lighten, b.lighten),
+            darken_to: f(a.darken_to, b.darken_to),
+            darken: f(a.darken, b.darken),
+        };
+        let tint = match (self.tint, to.tint) {
+            (None, None) => None,
+            (Some(a), None) => Some(a.with_alpha(a.a * (1.0 - t))),
+            (None, Some(b)) => Some(b.with_alpha(b.a * t)),
+            (Some(a), Some(b)) => Some(Color { r: f(a.r, b.r), g: f(a.g, b.g), b: f(a.b, b.b), a: f(a.a, b.a) }),
+        };
+        Self {
+            refraction: f(self.refraction, to.refraction),
+            depth: f(self.depth, to.depth),
+            dispersion: f(self.dispersion, to.dispersion),
+            frost: f(self.frost, to.frost),
+            splay: f(self.splay, to.splay),
+            specular: f(self.specular, to.specular),
+            rim: f(self.rim, to.rim),
+            rim_shade: f(self.rim_shade, to.rim_shade),
+            hairline: f(self.hairline, to.hairline),
+            edge: f(self.edge, to.edge),
+            shadow: Shadow {
+                offset_y: f(self.shadow.offset_y, to.shadow.offset_y),
+                blur: f(self.shadow.blur, to.shadow.blur),
+                opacity: f(self.shadow.opacity, to.shadow.opacity),
+            },
+            light_tone: tone(self.light_tone, to.light_tone),
+            dark_tone: tone(self.dark_tone, to.dark_tone),
+            adaptive: if t < 0.5 { self.adaptive } else { to.adaptive },
+            tint,
+            dim: f(self.dim, to.dim),
+        }
+    }
 }
 
 /// System-wide appearance and accessibility, shared by every glass in a scene.
@@ -378,6 +423,19 @@ impl Material {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lerp_hits_both_ends_and_fades_a_tint() {
+        let (plain, blue) = (Material::regular(), Material::tinted(Color::BLUE));
+        assert_eq!(plain.lerp(&blue, 1.0), blue);
+        assert_eq!(blue.lerp(&plain, 1.0).tint.map(|c| c.a), Some(0.0), "fades out by strength");
+        assert_eq!(plain.lerp(&blue, 0.0).tint.map(|c| c.a), Some(0.0), "fades in from zero, not from black");
+        let half = plain.lerp(&blue, 0.5).tint.unwrap();
+        assert_eq!((half.r, half.g, half.b, half.a), (Color::BLUE.r, Color::BLUE.g, Color::BLUE.b, 0.5), "keeps the hue while it fades");
+        assert_eq!(plain.lerp(&Material::clear(), 1.4), Material::clear(), "overshoot is clamped");
+        let mid = plain.lerp(&Material::clear(), 0.5);
+        assert!((mid.frost - 8.0).abs() < 1e-5 && (mid.specular - 0.35).abs() < 1e-5);
+    }
 
     #[test]
     fn large_regular_glass_is_frostier_than_small() {

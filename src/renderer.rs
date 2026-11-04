@@ -19,7 +19,6 @@ use std::ops::{Bound, Range, RangeBounds};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
-use crate::material::thickness;
 use crate::scene::{Geometry, GlassId, Scene};
 
 /// Inputs for one frame.
@@ -57,12 +56,23 @@ struct ShapeGpu {
     extra: [f32; 4],
 }
 
+/// One instanced quad: a cluster of shapes drawn as one smooth union.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
 struct GroupGpu {
     bounds: [f32; 4],
+    /// First shape, shape count, 1 when the shapes' materials differ (blend them), unused.
     info: [u32; 4],
+    /// Union radius, presence, press, unused.
     geo: [f32; 4],
+}
+
+/// One shape's material, resolved for its own size. Shapes in a group fuse their materials
+/// across the liquid neck with the same weights as their outlines, so a tinted button keeps
+/// its tint when it touches a plain one.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Pod, Zeroable)]
+struct MaterialGpu {
     optics: [f32; 4],
     lighting: [f32; 4],
     edge: [f32; 4],
@@ -85,9 +95,10 @@ struct Layer {
 #[derive(Default)]
 struct Packed {
     shapes: Vec<ShapeGpu>,
-    /// Two entries per group: the material resolved for its thinnest member, then for
-    /// its thickest. The shader blends them per pixel by each shape's thickness, so
-    /// fused glass keeps its own look and nothing jumps when a group splits.
+    /// One per shape, same index: each shape's own material, resolved for its own size. The
+    /// shader blends them per pixel as the shapes fuse, so fused glass keeps its own look
+    /// (tint, thickness, frost) and nothing jumps when a group splits.
+    materials: Vec<MaterialGpu>,
     groups: Vec<GroupGpu>,
     layers: Vec<Layer>,
     /// Farthest any group samples beyond its bounds (refraction + blur), px.
@@ -135,7 +146,7 @@ fn cluster(scene: &Scene, layers: Layers) -> Vec<Vec<Member>> {
     let mut members: Vec<Member> = scene
         .nodes
         .iter()
-        .filter(|(_, n)| !n.glass.material.is_identity() && n.presence.value > 1e-3 && layers.contains(&scene.z_of(n)))
+        .filter(|(_, n)| !scene.material_of(n).is_identity() && n.presence.value > 1e-3 && layers.contains(&scene.z_of(n)))
         .map(|(id, n)| Member {
             id,
             geo: scene.geometry(n),
@@ -182,6 +193,7 @@ fn cluster(scene: &Scene, layers: Layers) -> Vec<Vec<Member>> {
 
 fn pack(scene: &Scene, layers: Layers, scale: f32, viewport: Vec2, out: &mut Packed) {
     out.shapes.clear();
+    out.materials.clear();
     out.groups.clear();
     out.layers.clear();
     out.reach = 0.0;
@@ -194,72 +206,43 @@ fn pack(scene: &Scene, layers: Layers, scale: f32, viewport: Vec2, out: &mut Pac
         let presence = |m: &Member| scene.nodes[m.id].presence.value.clamp(0.0, 1.0);
         let p = members.iter().map(presence).fold(0.0, f32::max);
         let press = members.iter().map(|m| scene.nodes[m.id].press.value).fold(0.0, f32::max).clamp(0.0, 1.5);
-        let side = |m: &Member| m.geo.half.min_element() * 2.0;
-        let thinnest = members.iter().map(side).fold(f32::MAX, f32::min);
-        let thickest = members.iter().map(side).fold(0.0, f32::max);
-        let thin = lead.glass.material.resolve(thinnest, &scene.appearance);
-        let thick = lead.glass.material.resolve(thickest, &scene.appearance);
-        let (tau_thin, tau_thick) = (thickness(thinnest), thickness(thickest));
 
         let first = out.shapes.len() as u32;
         let mut bounds = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-        let mut max_depth: f32 = 1.0;
+        // How far the drop shadow reaches past the shapes, px.
+        let mut margin: f32 = 2.0 * s;
         for member in &members {
             let g = member.geo;
             let pm = presence(member);
             let others = members.iter().any(|o| o.id != member.id && presence(o) > 0.5);
             let shrink = (1.0 - pm) * g.half.min_element() * if others { 1.0 } else { 0.15 };
             let along = 1.0 + g.stretch;
-            // Where this shape sits between the group's thin and thick material.
-            let blend = if tau_thick > tau_thin { (thickness(side(member)) - tau_thin) / (tau_thick - tau_thin) } else { 0.0 };
-            let depth = thin.material.depth + (thick.material.depth - thin.material.depth) * blend;
-            let depth = (depth * s).min(g.half.min_element() * s).max(1.0);
-            max_depth = max_depth.max(depth);
+            // Each shape's own material at its own size: a 52 pt bar fused to a 400 pt
+            // panel stays thin glass, a tinted button next to a plain one stays tinted.
+            let resolved = scene.material_of(&scene.nodes[member.id]).resolve(g.half.min_element() * 2.0, &scene.appearance);
+            let m = resolved.material;
+            let depth = (m.depth * s).min(g.half.min_element() * s).max(1.0);
             out.shapes.push(ShapeGpu {
                 center_half: [g.center.x * s, g.center.y * s, g.half.x * s, g.half.y * s],
                 params: [g.radius * s, shrink * s, g.axis.x, g.axis.y],
                 stretch: [along, 1.0 / along, g.exponent, 0.0],
-                extra: [depth, blend, 0.0, 0.0],
+                extra: [depth, 0.0, 0.0, 0.0],
             });
+            out.materials.push(material_gpu(&resolved, p, press, s));
+            margin = margin.max(m.shadow.offset_y.abs() * s + 1.5 * m.shadow.blur * s);
+            out.reach = out.reach.max(depth * 1.2 * m.refraction + 8.0 * m.frost * 0.5 * s * p + 8.0);
             let c = g.center * s;
             let r = g.reach() * s;
             bounds = union(bounds, [c.x - r.x, c.y - r.y, c.x + r.x, c.y + r.y]);
         }
 
-        // Thick glass frosts and shadows the most, so it sizes the quad for both.
-        let m = thick.material;
         let k = spacing * s;
-        let shadow_sigma = m.shadow.blur * 0.5 * s;
-        let margin = (m.shadow.offset_y.abs() * s + 3.0 * shadow_sigma).max(2.0 * s) + k * 0.25 + 1.0;
-        let bounds = clamp_bounds(expand(bounds, margin), screen);
-        out.reach = out.reach.max(max_depth * 1.2 * m.refraction + 8.0 * m.frost * 0.5 * s * p + 8.0);
+        let bounds = clamp_bounds(expand(bounds, margin + k * 0.25 + 1.0), screen);
+        // Members with the same material and size (a row of equal buttons) skip blending.
+        let blend = out.materials[first as usize..].windows(2).any(|w| w[0] != w[1]);
+        out.groups.push(GroupGpu { bounds, info: [first, members.len() as u32, u32::from(blend), 0], geo: [k, p, press, 0.0] });
 
-        let tone_a = |t: crate::Tone| [t.lift * p, t.luminance, t.luminance_mix * p, t.lighten * p];
-        let tone_b = |t: crate::Tone| [t.darken_to, t.darken * p, 0.0, 0.0];
-        for resolved in [thin, thick] {
-            let m = resolved.material;
-            let tint = m.tint.map_or([0.0; 4], |c| {
-                let lab = c.to_oklab();
-                // Stained glass, never a solid fill: full alpha keeps 15 % of the backdrop.
-                [lab[0], lab[1], lab[2], c.a * 0.85 * p]
-            });
-            out.groups.push(GroupGpu {
-                bounds,
-                info: [first, members.len() as u32, 0, 0],
-                geo: [k, p, press, resolved.adapt],
-                optics: [m.refraction * p, 0.0, m.dispersion * p, m.frost * 0.5 * s * p],
-                lighting: [m.splay, m.specular * p * (1.0 + 0.6 * press), m.rim * p, m.rim_shade * p],
-                edge: [m.hairline * p, m.edge * p, resolved.contrast * p, m.dim * p],
-                shadow: [m.shadow.offset_y * s, m.shadow.blur * 0.5 * s, m.shadow.opacity * p, 0.0],
-                light_a: tone_a(m.light_tone),
-                light_b: tone_b(m.light_tone),
-                dark_a: tone_a(m.dark_tone),
-                dark_b: tone_b(m.dark_tone),
-                tint,
-            });
-        }
-
-        let index = out.groups.len() as u32 / 2 - 1;
+        let index = out.groups.len() as u32 - 1;
         let z = members[0].z;
         match out.layers.last_mut() {
             Some(layer) if layer.z == z => {
@@ -268,6 +251,30 @@ fn pack(scene: &Scene, layers: Layers, scale: f32, viewport: Vec2, out: &mut Pac
             }
             _ => out.layers.push(Layer { groups: index..index + 1, bounds, z }),
         }
+    }
+}
+
+/// GPU form of a resolved material. Strengths scale with the group's `presence`, so glass
+/// materializes by ramping its lensing in; the specular brightens with `press`.
+fn material_gpu(resolved: &crate::material::Resolved, presence: f32, press: f32, scale: f32) -> MaterialGpu {
+    let (m, p, s) = (resolved.material, presence, scale);
+    let tone_a = |t: crate::Tone| [t.lift * p, t.luminance, t.luminance_mix * p, t.lighten * p];
+    let tone_b = |t: crate::Tone| [t.darken_to, t.darken * p, 0.0, 0.0];
+    let tint = m.tint.map_or([0.0; 4], |c| {
+        let lab = c.to_oklab();
+        // Stained glass, never a solid fill: full alpha keeps 15 % of the backdrop.
+        [lab[0], lab[1], lab[2], c.a * 0.85 * p]
+    });
+    MaterialGpu {
+        optics: [m.refraction * p, resolved.adapt, m.dispersion * p, m.frost * 0.5 * s * p],
+        lighting: [m.splay, m.specular * p * (1.0 + 0.6 * press), m.rim * p, m.rim_shade * p],
+        edge: [m.hairline * p, m.edge * p, resolved.contrast * p, m.dim * p],
+        shadow: [m.shadow.offset_y * s, m.shadow.blur * 0.5 * s, m.shadow.opacity * p, 0.0],
+        light_a: tone_a(m.light_tone),
+        light_b: tone_b(m.light_tone),
+        dark_a: tone_a(m.dark_tone),
+        dark_b: tone_b(m.dark_tone),
+        tint,
     }
 }
 
@@ -452,6 +459,7 @@ pub struct Renderer {
     pipelines: Pipelines,
     globals: wgpu::Buffer,
     shapes: wgpu::Buffer,
+    materials: wgpu::Buffer,
     groups: wgpu::Buffer,
     /// Blur of the content alone.
     pyramid: Option<Pyramid>,
@@ -475,6 +483,7 @@ pub struct Renderer {
 struct Uploaded {
     globals: Option<Globals>,
     shapes: Vec<ShapeGpu>,
+    materials: Vec<MaterialGpu>,
     groups: Vec<GroupGpu>,
 }
 
@@ -548,6 +557,7 @@ impl Renderer {
                 mapped_at_creation: false,
             }),
             shapes: storage(device, "liquid-rust shapes", size_of::<ShapeGpu>() as u64 * 16),
+            materials: storage(device, "liquid-rust materials", size_of::<MaterialGpu>() as u64 * 16),
             groups: storage(device, "liquid-rust groups", size_of::<GroupGpu>() as u64 * 16),
             pipelines,
             pyramid: None,
@@ -650,7 +660,7 @@ impl Renderer {
         }
 
         // Glass pass inputs: the shared buffers, the backdrop `src` and its blur pyramid.
-        let (globals, shapes, groups) = (&self.globals, &self.shapes, &self.groups);
+        let (globals, shapes, materials, groups) = (&self.globals, &self.shapes, &self.materials, &self.groups);
         let mut glass_group = |src: &wgpu::TextureView, blur: &Pyramid, layered: bool| {
             binds.glass.get((src.clone(), layered), |(src, _)| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -663,6 +673,7 @@ impl Renderer {
                         wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&pipelines.sampler) },
                         wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(src) },
                         wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&blur.full) },
+                        wgpu::BindGroupEntry { binding: 6, resource: materials.as_entire_binding() },
                     ],
                 })
             })
@@ -713,6 +724,7 @@ impl Renderer {
             self.uploaded.globals = Some(globals);
         }
         let grown = write_storage(device, queue, &mut self.shapes, "liquid-rust shapes", &self.packed.shapes, &mut self.uploaded.shapes)
+            | write_storage(device, queue, &mut self.materials, "liquid-rust materials", &self.packed.materials, &mut self.uploaded.materials)
             | write_storage(device, queue, &mut self.groups, "liquid-rust groups", &self.packed.groups, &mut self.uploaded.groups);
         if grown {
             // The glass bind groups point at the old buffers.
@@ -821,10 +833,35 @@ mod tests {
         while scene.update(1.0 / 60.0) {}
         let mut packed = Packed::default();
         pack(&scene, ALL_LAYERS, 1.0, Vec2::new(400.0, 500.0), &mut packed);
-        assert_eq!((packed.layers[0].groups.clone(), packed.groups.len()), (0..1, 2), "one group, thin + thick entries");
-        let blend: Vec<f32> = packed.shapes.iter().map(|s| s.extra[1]).collect();
-        assert_eq!(blend, [0.0, 1.0]);
-        assert!(packed.groups[1].shadow[1] > packed.groups[0].shadow[1], "thick entry casts the softer shadow");
+        assert_eq!((packed.layers[0].groups.clone(), packed.groups.len(), packed.materials.len()), (0..1, 1, 2), "one group, a material per shape");
+        assert!(packed.materials[1].shadow[1] > packed.materials[0].shadow[1], "the thick panel casts the softer shadow");
+        assert_eq!(packed.groups[0].info[2], 1, "different materials are blended");
+    }
+
+    #[test]
+    fn fused_glass_keeps_its_own_tint() {
+        let mut scene = Scene::new();
+        let c = scene.add_container(20.0, 0);
+        scene.add(Glass::new(Rect::new(0.0, 0.0, 44.0, 44.0)).material(crate::Material::tinted(crate::Color::BLUE)).container(c));
+        scene.add(Glass::new(Rect::new(50.0, 0.0, 44.0, 44.0)).container(c));
+        while scene.update(1.0 / 60.0) {}
+        let mut packed = Packed::default();
+        pack(&scene, ALL_LAYERS, 1.0, Vec2::new(200.0, 100.0), &mut packed);
+        assert_eq!(packed.groups.len(), 1, "fused");
+        assert!(packed.materials[0].tint[3] > 0.0 && packed.materials[1].tint[3] == 0.0, "each keeps its own tint");
+    }
+
+    #[test]
+    fn a_row_of_equal_buttons_skips_material_blending() {
+        let mut scene = Scene::new();
+        let c = scene.add_container(20.0, 0);
+        for i in 0..3 {
+            scene.add(Glass::new(Rect::new(i as f32 * 50.0, 0.0, 44.0, 44.0)).interactive().container(c));
+        }
+        while scene.update(1.0 / 60.0) {}
+        let mut packed = Packed::default();
+        pack(&scene, ALL_LAYERS, 2.0, Vec2::new(400.0, 200.0), &mut packed);
+        assert_eq!((packed.groups.len(), packed.groups[0].info[1], packed.groups[0].info[2]), (1, 3, 0));
     }
 
     #[test]
