@@ -26,7 +26,10 @@ lock-screen button and the dock match the kit's render pixel profile for pixel p
   strengthens over busy content and fades over flat light content.
 - **Liquid.** Glass in one container is drawn as a single smooth-union distance field, so
   shapes grow a liquid neck and fuse as they approach, then split apart. This comes from the
-  geometry, not from collision physics.
+  geometry, not from collision physics. Fused shapes keep their own material: a tinted
+  button pressed against a plain one stays tinted, a thin bar fused to a large panel stays
+  thin glass, and the two blend only across the neck (since 0.2.5; before, the whole group
+  took the material of the glass added first).
 - **Motion.** Analytic springs using Apple's `duration` / `bounce` model, so they behave the same
   at any frame rate and can be interrupted mid-flight. Includes press glow from the finger, a
   draggable lens that stretches with speed, materialize in and out, and morphing between frames.
@@ -70,6 +73,8 @@ renderer.render(&device, &queue, &mut encoder, &Frame {
 
 Input: `scene.pointer_down(p)`, `pointer_move(p)`, `pointer_up()` (points).
 Animate layout with `scene.set_frame(id, rect)`. Use `scene.remove(id)` to dematerialize glass.
+Fade to another material with `scene.set_material_with(id, material, spring)`: a primary
+button's tint fades in once it can act, instead of switching (`set_material` stays instant).
 
 ### Merging, physics and morphs
 
@@ -222,7 +227,8 @@ Where the cost goes:
 - One full-screen copy of the content.
 - A blur pyramid limited to the region the glass can actually sample.
 - One instanced quad per glass group. Every distance-field evaluation stays inside that quad,
-  and the inner rim shadows are skipped deep inside large glass.
+  and the inner rim shadows are skipped deep inside large glass. Fused shapes blend their
+  materials per pixel only when they differ; a row of equal buttons skips it.
 - CPU work per frame is O(n) per container plus a buffer upload. Clustering is O(n²) within a
   container, which is fine for tens of shapes. Buffers are only written when their contents
   change, and bind groups are kept across frames instead of being created every frame (a

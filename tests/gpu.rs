@@ -385,3 +385,44 @@ fn a_panel_takes_the_scheme_face_instead_of_a_grey_blend() {
     let (light, _) = panel(0.5, false, 200.0, &night).unwrap();
     assert!(light > 0.45, "light panel over a dark backdrop: luminance {light}");
 }
+
+// ---------------------------------------------------------------- fused materials
+
+/// Mean (r, g, b) of the 8 x 8 px square centred on `(x, y)`.
+fn mean_rgb(data: &[u8], x: u32, y: u32) -> [f32; 3] {
+    let mut sum = [0.0; 3];
+    for py in y - 4..y + 4 {
+        for px in x - 4..x + 4 {
+            for (s, &v) in sum.iter_mut().zip(pixel(data, px, py)) {
+                *s += f32::from(v) / 64.0;
+            }
+        }
+    }
+    sum
+}
+
+#[test]
+fn fused_glass_keeps_each_shapes_own_tint() {
+    // A blue primary button fused by a liquid neck to a plain one (6 pt apart, spacing 20):
+    // each keeps its own material. Both orders, since the group used to take the material
+    // of whichever was added first.
+    for tinted_first in [true, false] {
+        let mut scene = Scene::new();
+        let bar = scene.add_container(20.0, 0);
+        let tinted = Glass::new(Rect::new(14.0, 44.0, 44.0, 40.0)).material(Material::tinted(Color::BLUE)).container(bar);
+        let plain = Glass::new(Rect::new(64.0, 44.0, 44.0, 40.0)).container(bar);
+        let order = if tinted_first { [tinted, plain] } else { [plain, tinted] };
+        for glass in order {
+            scene.add(glass);
+        }
+        settle(&mut scene);
+        let Some(out) = render_at(&scene, &solid([128, 128, 128]), 1.0) else { return };
+        let [r, _, b] = mean_rgb(&out, 36, 64);
+        assert!(b - r > 60.0, "tinted_first {tinted_first}: the tinted button lost its tint ({r}, {b})");
+        let [r, g, b] = mean_rgb(&out, 86, 64);
+        assert!((b - r).abs() < 12.0 && (g - r).abs() < 12.0, "tinted_first {tinted_first}: the plain button turned blue ({r}, {g}, {b})");
+        // The neck between them is a blend, not a hard seam: somewhere in between.
+        let [r, _, b] = mean_rgb(&out, 61, 64);
+        assert!(b - r > 5.0, "tinted_first {tinted_first}: the neck shows no trace of the tint ({r}, {b})");
+    }
+}

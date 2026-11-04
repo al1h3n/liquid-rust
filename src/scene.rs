@@ -189,6 +189,9 @@ pub(crate) struct Node {
     /// Outline being morphed away from: `morph` 0 draws this shape, 1 draws `glass.shape`.
     pub from_shape: Shape,
     pub morph: Animated,
+    /// Material being faded away from: `material_mix` 0 draws this, 1 draws `glass.material`.
+    pub from_material: Material,
+    pub material_mix: Animated,
     pub removing: bool,
     pub order: u64,
 }
@@ -356,6 +359,8 @@ impl Scene {
             stretch_dir: Vec2::X,
             from_shape: glass.shape,
             morph: at(1.0),
+            from_material: glass.material,
+            material_mix: at(1.0),
             removing: false,
             order: self.next_order,
         })
@@ -475,11 +480,42 @@ impl Scene {
         node.h.snap(frame.height);
     }
 
-    /// Replaces the material (instantly).
+    /// Replaces the material (instantly). Use [`Scene::set_material_with`] to fade.
     pub fn set_material(&mut self, id: GlassId, material: Material) {
         if let Some(node) = self.nodes.get_mut(id) {
             node.glass.material = material;
+            node.from_material = material;
+            node.material_mix.snap(1.0);
         }
+    }
+
+    /// Changes the material with a spring: every knob travels from what is on screen now
+    /// to `material`, so a tint fades in or out (a primary button turning blue once it can
+    /// act) instead of switching. Interrupting it mid-way carries on from where it is.
+    ///
+    /// ```
+    /// use liquid_rust::{Color, Glass, Material, Rect, Scene, Spring};
+    /// let mut scene = Scene::new();
+    /// let copy = scene.add(Glass::new(Rect::new(0.0, 0.0, 100.0, 40.0)).interactive());
+    /// scene.set_material_with(copy, Material::tinted(Color::BLUE), Spring::new(0.3, 0.0));
+    /// while scene.update(1.0 / 120.0) {}
+    /// assert_eq!(scene.glass(copy).unwrap().material, Material::tinted(Color::BLUE));
+    /// ```
+    pub fn set_material_with(&mut self, id: GlassId, material: Material, spring: Spring) {
+        let spring = self.spring(spring);
+        let Some(node) = self.nodes.get_mut(id) else { return };
+        if node.glass.material == material {
+            return;
+        }
+        node.from_material = node.from_material.lerp(&node.glass.material, node.material_mix.value);
+        node.glass.material = material;
+        node.material_mix.snap(0.0);
+        node.material_mix.animate_to(1.0, spring);
+    }
+
+    /// Material on screen right now, mid-fade.
+    pub(crate) fn material_of(&self, node: &Node) -> Material {
+        if node.material_mix.value >= 1.0 { node.glass.material } else { node.from_material.lerp(&node.glass.material, node.material_mix.value) }
     }
 
     /// Replaces the outline (instantly).
@@ -583,7 +619,7 @@ impl Scene {
 
         let mut moving = false;
         for node in self.nodes.values_mut() {
-            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph] {
+            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph, &mut node.material_mix] {
                 moving |= a.step(dt);
             }
         }
@@ -598,7 +634,7 @@ impl Scene {
     fn settle(&mut self) {
         for node in self.nodes.values_mut() {
             node.stretch.target = 0.0;
-            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph] {
+            for a in [&mut node.x, &mut node.y, &mut node.w, &mut node.h, &mut node.presence, &mut node.press, &mut node.lift, &mut node.stretch, &mut node.morph, &mut node.material_mix] {
                 a.snap(a.target);
             }
         }
@@ -672,6 +708,32 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn material_fades_and_can_be_interrupted() {
+        let mut scene = Scene::new();
+        let id = scene.add(Glass::new(Rect::new(0.0, 0.0, 100.0, 40.0)));
+        settle(&mut scene);
+        let blue = Material::tinted(crate::Color::BLUE);
+        scene.set_material_with(id, blue, Spring::new(0.4, 0.0));
+        let strength = |scene: &Scene| scene.material_of(&scene.nodes[id]).tint.map_or(0.0, |c| c.a);
+        assert_eq!(strength(&scene), 0.0, "starts from what is on screen");
+        for _ in 0..12 {
+            scene.update(1.0 / 120.0);
+        }
+        let mid = strength(&scene);
+        assert!(mid > 0.05 && mid < 0.95, "fading in: {mid}");
+        // Back to plain mid-way: no jump, then it fades out completely.
+        scene.set_material_with(id, Material::regular(), Spring::new(0.4, 0.0));
+        assert!((strength(&scene) - mid).abs() < 1e-5, "carries on from {mid}");
+        settle(&mut scene);
+        assert_eq!(scene.material_of(&scene.nodes[id]), Material::regular());
+        // The instant setter cancels any fade.
+        scene.set_material_with(id, blue, Spring::new(0.4, 0.0));
+        scene.set_material(id, blue);
+        assert_eq!(scene.material_of(&scene.nodes[id]), blue);
+        assert!(!scene.update(1.0 / 120.0), "nothing left to animate");
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! ```
 //! An optional fourth argument sets the appearance: `ultra-clear`, `tinted`, `dark`,
 //! `reduce-transparency` or `increase-contrast`.
-//! `bench` renders the showcase 300 times per case and prints the average frame time: glass
-//! at rest and a sheet springing over the panel below it, over static and changing content.
+//! `bench` renders the showcase 300 times per case (`LIQUID_BENCH_FRAMES=n` to change) and
+//! prints the average frame time: glass at rest and a sheet springing over the panel below
+//! it, over static and changing content.
 //! `search` catches a results panel mid-way through growing out of a search bar.
 //! `lock` and `home` recreate Apple's iOS 26/27 Figma kit controls at their kit
 //! positions (402 x 874 pt at 3x) so the result can be compared with the kit render.
@@ -129,13 +130,17 @@ fn main() {
     println!("wrote {out}");
 }
 
-const BENCH_FRAMES: u32 = 300;
+/// Frames per bench case; `LIQUID_BENCH_FRAMES` lowers it on slow (software) renderers.
+fn bench_frames() -> u32 {
+    std::env::var("LIQUID_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(300)
+}
 
 /// Average frame time with the glass at rest and with the sheet springing up and down over
 /// the panel below it, each over content that holds still and content that changes.
 fn bench(gpu: &Offscreen, renderer: &mut Renderer, scene: &mut Scene, sheet: GlassId) {
     let (w, h) = gpu.size;
-    println!("{}, {w}x{h}, {BENCH_FRAMES} frames per case", gpu.adapter);
+    let frames = bench_frames();
+    println!("{}, {w}x{h}, {frames} frames per case", gpu.adapter);
     let up = Rect { y: SHEET.y - 130.0, ..SHEET };
     for (label, moving, content_changed) in [
         ("glass at rest, static content", false, false),
@@ -146,7 +151,7 @@ fn bench(gpu: &Offscreen, renderer: &mut Renderer, scene: &mut Scene, sheet: Gla
         gpu.draw(renderer, scene, true);
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU finished");
         let start = std::time::Instant::now();
-        for i in 0..BENCH_FRAMES {
+        for i in 0..frames {
             if moving {
                 if i % 60 == 0 {
                     scene.set_frame(sheet, if (i / 60) % 2 == 0 { up } else { SHEET });
@@ -156,7 +161,7 @@ fn bench(gpu: &Offscreen, renderer: &mut Renderer, scene: &mut Scene, sheet: Gla
             gpu.draw(renderer, scene, content_changed);
         }
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU finished");
-        let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(BENCH_FRAMES);
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(frames);
         println!("{label:>32}: {ms:.3} ms/frame");
         scene.set_frame(sheet, SHEET);
         while scene.update(1.0 / 120.0) {}
