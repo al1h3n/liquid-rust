@@ -33,6 +33,10 @@ lock-screen button and the dock match the kit's render pixel profile for pixel p
 - **Motion.** Analytic springs using Apple's `duration` / `bounce` model, so they behave the same
   at any frame rate and can be interrupted mid-flight. Includes press glow from the finger, a
   draggable lens that stretches with speed, materialize in and out, and morphing between frames.
+  Surfaces open and close on *launched* springs (`Animated::launch_to`, `Spring::EMERGE` /
+  `Spring::RECEDE`, since 0.2.6): full speed on the first frame and an exponential landing,
+  fitted frame by frame to a 60 fps recording of iOS 27, where a spring from rest lags for
+  50 ms and leaves a growing menu squeezed into a blob.
 - **Presets.** `regular`, `clear`, `tinted`, `identity`, plus `clear_bar` for dock and search
   chrome. The iOS 27 transparency slider and Reduce Transparency, Increase Contrast and Reduce
   Motion are all supported.
@@ -100,7 +104,18 @@ let results = scene.expand_from(bar, Glass::new(Rect::new(40.0, 96.0, 320.0, 400
 scene.collapse_into(results, bar, Spring::new(0.35, 0.0));
 ```
 
-  The new glass starts at the bar's current frame, fused with it. It stretches a liquid neck
+  For a menu, popover or sheet that opens *from* its button, use `morph_from` /
+  `shrink_into` instead (iOS 27's behaviour): the new glass starts as the button itself (its
+  frame, outline and full presence), launches out on `Spring::EMERGE`, never joins the
+  button's container (no neck, no bulging button), and on close launches back on
+  `Spring::RECEDE` and is dropped the moment it lands on the button.
+
+```rust
+let menu = scene.morph_from(button, Glass::new(Rect::new(40.0, 96.0, 264.0, 320.0)).shape(Shape::Rounded(28.0)).z(1), Spring::EMERGE);
+scene.shrink_into(menu, button, Spring::RECEDE);
+```
+
+  With `expand_from`, the new glass starts at the bar's current frame, fused with it. It stretches a liquid neck
   while it grows and pinches off once the gap passes half the spacing. Here the gap ends at
   20 pt, past the 16 pt spacing, so both shapes settle clean. For the two to stay joined, end
   the gap under half the spacing instead. The outline morphs as well: glass grown out of a

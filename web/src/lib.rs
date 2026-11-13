@@ -145,6 +145,29 @@ impl LiquidGlass {
         }
     }
 
+    /// Grows new glass (CSS pixels) *as* glass `source`: one shape, launched at full speed
+    /// ([`Spring::EMERGE`]), never fused to `source` by a liquid neck; see
+    /// [`Scene::morph_from`]. Pass a higher `z` so it covers the button. Returns its handle.
+    #[wasm_bindgen(js_name = morphFrom)]
+    #[expect(clippy::too_many_arguments, reason = "flat JS binding")]
+    pub fn morph_from(&mut self, source: u32, x: f32, y: f32, w: f32, h: f32, radius: f32, material: &str, tint: u32, z: i32) -> u32 {
+        let glass = base_glass(x, y, w, h, radius, material, tint).z(z);
+        let id = match self.glass.get(source as usize) {
+            Some(&from) => self.scene.morph_from(from, glass, Spring::EMERGE),
+            None => self.scene.add(glass),
+        };
+        self.glass.push(id);
+        self.glass.len() as u32 - 1
+    }
+
+    /// Launches glass `id` back into glass `target` ([`Spring::RECEDE`]) and drops it on landing.
+    #[wasm_bindgen(js_name = shrinkInto)]
+    pub fn shrink_into(&mut self, id: u32, target: u32) {
+        if let (Some(&id), Some(&target)) = (self.glass.get(id as usize), self.glass.get(target as usize)) {
+            self.scene.shrink_into(id, target, Spring::RECEDE);
+        }
+    }
+
     /// Morphs glass `id` to a new frame (CSS pixels).
     #[wasm_bindgen(js_name = setFrame)]
     pub fn set_frame(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {

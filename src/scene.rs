@@ -254,14 +254,17 @@ const MATERIALIZE_OUT: Spring = Spring::new(0.3, 0.0);
 const PRESS_DOWN: Spring = Spring::new(0.25, 0.0);
 const PRESS_RELEASE: Spring = Spring::new(0.5, 0.35);
 const LIFT: Spring = Spring::new(0.3, 0.15);
-const JELLY: Spring = Spring::new(0.35, 0.4);
+/// Stretch along a drag settling back. iOS 27 shows almost none: a dragged glass pill keeps
+/// its shape even in a fast flick, so the jelly is small and barely bounces (0.2.5 had
+/// 0.35 s / 0.4 and a 25 % stretch, which read as the shape being squeezed and smashed).
+const JELLY: Spring = Spring::new(0.3, 0.1);
 const GLOW_IN: Spring = Spring::new(0.2, 0.0);
 const GLOW_SPREAD: Spring = Spring::new(0.45, 0.0);
 const GLOW_OUT: Spring = Spring::new(0.6, 0.0);
 const LIGHT_SWEEP: Spring = Spring::new(0.8, 0.0);
 /// Drag speed (pt/s) that produces the full stretch.
 const STRETCH_SPEED: f32 = 2500.0;
-const MAX_STRETCH: f32 = 0.25;
+const MAX_STRETCH: f32 = 0.1;
 const LENS_LIFT: f32 = 0.3;
 
 /// All glass on screen plus the shared appearance, light and touch state.
@@ -447,6 +450,71 @@ impl Scene {
         }
     }
 
+    /// Grows new glass *as* `source`, the way iOS 27 opens a menu, popover or sheet from
+    /// its button: one shape that leaves the button's frame and outline at full speed and
+    /// lands on `glass.frame` with `glass.shape` ([`Spring::EMERGE`] launched, see
+    /// [`Animated::launch_to`]). Unlike [`Scene::expand_from`] it never joins the button's
+    /// container, so no liquid neck stretches between the two and the button never bulges:
+    /// put the new glass on a higher z (or later) so it covers the button while it grows.
+    ///
+    /// ```
+    /// use liquid_rust::{Glass, Rect, Scene, Shape, Spring};
+    /// let mut scene = Scene::new();
+    /// let button = scene.add(Glass::new(Rect::new(10.0, 10.0, 44.0, 44.0)).shape(Shape::Capsule));
+    /// let menu = scene.morph_from(button, Glass::new(Rect::new(10.0, 10.0, 240.0, 300.0)).shape(Shape::Rounded(28.0)).z(1), Spring::EMERGE);
+    /// assert_eq!(scene.current_frame(menu), scene.current_frame(button), "starts as the button");
+    /// while scene.update(1.0 / 120.0) {}
+    /// assert_eq!(scene.current_frame(menu), Some(Rect::new(10.0, 10.0, 240.0, 300.0)));
+    /// ```
+    pub fn morph_from(&mut self, source: GlassId, glass: Glass, spring: Spring) -> GlassId {
+        let Some(start) = self.current_frame(source) else { return self.add(glass) };
+        let from_shape = self.nodes[source].glass.shape;
+        let target = glass.frame;
+        let id = self.add(Glass { frame: start, ..glass });
+        let spring = self.spring(spring);
+        let node = &mut self.nodes[id];
+        // The button's glass is already on screen: the new shape is it, never materializing.
+        node.presence.snap(1.0);
+        node.from_shape = from_shape;
+        node.morph.snap(0.0);
+        node.morph.launch_to(1.0, spring, 1.0);
+        self.set_frame_launched(id, target, spring);
+        id
+    }
+
+    /// Reverse of [`Scene::morph_from`]: launches `id` back into `target`'s frame and
+    /// outline ([`Spring::RECEDE`]) and drops it once it has landed there, so the last frame
+    /// is exactly the button. Without the target it dematerializes.
+    pub fn shrink_into(&mut self, id: GlassId, target: GlassId, spring: Spring) {
+        let Some((frame, shape)) = self.glass(target).map(|g| (g.frame, g.shape)) else { return self.remove(id) };
+        let spring = self.spring(spring);
+        self.set_frame_launched(id, frame, spring);
+        if let Some(node) = self.nodes.get_mut(id) {
+            // Glass that grew out of this target morphs back from where it is; any other
+            // starts from its own outline.
+            if node.from_shape != shape {
+                node.from_shape = shape;
+                node.morph.snap(1.0);
+            }
+            node.morph.launch_to(0.0, spring, 1.0);
+            node.removing = true;
+        }
+    }
+
+    /// Moves/resizes on a launched spring ([`Animated::launch_to`] at 1): full speed on the
+    /// first frame, an exponential landing. Use it for anything a tap sends somewhere (a
+    /// panel opening, a field widening on focus); [`Scene::set_frame_with`] for layout that
+    /// should ease in.
+    pub fn set_frame_launched(&mut self, id: GlassId, frame: Rect, spring: Spring) {
+        let spring = self.spring(spring);
+        let Some(node) = self.nodes.get_mut(id) else { return };
+        node.glass.frame = frame;
+        node.x.launch_to(frame.x, spring, 1.0);
+        node.y.launch_to(frame.y, spring, 1.0);
+        node.w.launch_to(frame.width, spring, 1.0);
+        node.h.launch_to(frame.height, spring, 1.0);
+    }
+
     /// `true` when glass in `container` liquid-merges with `other`.
     fn fuses(&self, other: GlassId, container: Option<ContainerId>) -> bool {
         container.is_some_and(|c| self.glass(other).is_some_and(|g| g.container == Some(c)) && self.containers.get(c).is_some_and(|c| c.spacing > 0.0))
@@ -589,14 +657,15 @@ impl Scene {
         }
     }
 
-    /// Releases the press: bounces back, the glow fades, a lens drops and jiggles.
+    /// Releases the press: bounces back, the glow fades, a lens drops back to a knob.
     pub fn pointer_up(&mut self) {
         let release = self.spring(PRESS_RELEASE);
-        let lift = self.spring(Spring::SNAPPY);
+        // iOS 27: the lens drops back to a solid knob in about 0.1 s, without a wobble.
+        let lift = self.spring(Spring::KNOB_SETTLE);
         let jelly = self.spring(JELLY);
         if let Some(node) = self.pressed.take().and_then(|id| self.nodes.get_mut(id)) {
             node.press.animate_to(0.0, release);
-            node.lift.animate_to(0.0, lift);
+            node.lift.launch_to(0.0, lift, 1.0);
             node.stretch.animate_to(0.0, jelly);
         }
         self.drag = None;
@@ -866,7 +935,7 @@ mod tests {
             scene.pointer_move(Vec2::new(20.0 + i as f32 * 30.0, 20.0));
             scene.update(1.0 / 120.0);
         }
-        assert!(scene.nodes[id].stretch.value > 0.1);
+        assert!(scene.nodes[id].stretch.value > 0.05, "stretch {}", scene.nodes[id].stretch.value);
     }
 
     #[test]
@@ -962,6 +1031,41 @@ mod tests {
             }
             // Dropped within a sub-pixel of the button's circle (merged, nothing left to see).
             assert!((last.radius - round.radius).abs() < 0.1 && (last.exponent - 2.0).abs() < 0.01, "dropped as a circle: {last:?}");
+        }
+    }
+
+    #[test]
+    fn morph_grows_as_one_shape_and_lands_on_the_button() {
+        for reduce_motion in [false, true] {
+            let mut scene = Scene::new();
+            scene.appearance.reduce_motion = reduce_motion;
+            let bar = scene.add_container(16.0, 0);
+            let button = scene.add(Glass::new(Rect::new(300.0, 100.0, 44.0, 44.0)).shape(Shape::Capsule).container(bar));
+            settle(&mut scene);
+            let round = scene.geometry(&scene.nodes[button]);
+            let menu = scene.morph_from(button, Glass::new(Rect::new(80.0, 100.0, 264.0, 320.0)).shape(Shape::Rounded(28.0)).z(1), Spring::EMERGE);
+            assert_eq!(scene.glass(menu).unwrap().container, None, "never joins the button's container: no neck");
+            assert_eq!(scene.nodes[menu].presence.value, 1.0, "is the button, never materializes");
+            let start = scene.geometry(&scene.nodes[menu]);
+            assert_eq!((start.radius, start.exponent), (round.radius, round.exponent));
+            // Launched: a fifth of the way on the first 60 Hz frame (a spring from rest: 3 %).
+            scene.update(1.0 / 60.0);
+            let width = scene.current_frame(menu).unwrap().width;
+            assert!(width > 44.0 + 0.2 * (264.0 - 44.0), "width after one frame: {width}");
+            settle(&mut scene);
+            assert_eq!(scene.current_frame(menu), Some(Rect::new(80.0, 100.0, 264.0, 320.0)));
+
+            scene.shrink_into(menu, button, Spring::RECEDE);
+            let mut last = scene.geometry(&scene.nodes[menu]);
+            let mut widest = 0.0_f32;
+            while scene.nodes.contains_key(menu) {
+                last = scene.geometry(&scene.nodes[menu]);
+                widest = widest.max(scene.current_frame(menu).unwrap().width);
+                scene.update(1.0 / 120.0);
+            }
+            assert!(widest <= 264.0 + 1e-3, "never swells while closing: {widest}");
+            assert!((last.radius - round.radius).abs() < 0.1, "lands as the button's capsule: {last:?}");
+            assert!(scene.glass(button).is_some());
         }
     }
 

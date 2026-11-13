@@ -31,6 +31,18 @@ impl Spring {
     pub const BOUNCY: Self = Self::new(0.5, 0.3);
     /// SwiftUI `.interactiveSpring`: tight follow of a finger.
     pub const INTERACTIVE: Self = Self::new(0.15, 0.14);
+    /// A surface opening (a menu, popover or sheet growing out of its button). Use it with
+    /// [`Animated::launch_to`] at a launch of 1: the surface leaves at full speed and
+    /// decelerates exponentially (time constant 72 ms), 95 % there after 0.21 s, settled by
+    /// 0.45 s. Measured on iOS 27 (60 fps recording of Control Center, share sheets and
+    /// lock-screen sheets): no ease-in, no overshoot.
+    pub const EMERGE: Self = Self::new(0.45, 0.0);
+    /// A surface closing back into its button: the same launched curve, quicker (time
+    /// constant 48 ms, 95 % after 0.14 s). Closing never bounces.
+    pub const RECEDE: Self = Self::new(0.3, 0.0);
+    /// A slider or switch knob dropping from its glass lens back to a solid knob once the
+    /// finger lifts: about 0.1 s, no wobble (iOS 27).
+    pub const KNOB_SETTLE: Self = Self::new(0.18, 0.0);
 
     /// Creates a spring from a duration (seconds) and bounce.
     pub const fn new(duration: f32, bounce: f32) -> Self {
@@ -42,7 +54,8 @@ impl Spring {
         Self::new(self.duration * 0.8, self.bounce.min(0.0))
     }
 
-    fn angular_frequency(self) -> f32 {
+    /// Natural frequency ω0 = 2π / duration, in radians per second.
+    pub fn angular_frequency(self) -> f32 {
         TAU / self.duration.max(1e-3)
     }
 
@@ -110,6 +123,33 @@ impl Animated {
     pub fn animate_to(&mut self, target: f32, spring: Spring) {
         self.target = target;
         self.spring = spring;
+    }
+
+    /// Retargets and *launches*: the value leaves toward `target` at `launch × ω0 × distance`
+    /// instead of easing in from rest. At a launch of 1 on a bounce-0 spring the offset
+    /// decays as a pure exponential `e^(−ω0·t)`: full speed on the first frame, a soft
+    /// landing. That is how iOS 27 opens and closes surfaces ([`Spring::EMERGE`],
+    /// [`Spring::RECEDE`]); a spring from rest spends its first 50 ms barely moving, which
+    /// reads as lag and leaves a growing panel squeezed into a blob.
+    ///
+    /// A value already moving toward the target faster than that keeps its speed (a flick
+    /// that is still travelling); otherwise the launch velocity replaces it, so reversing
+    /// mid-flight answers at once.
+    ///
+    /// ```
+    /// use liquid_rust::{Animated, Spring};
+    /// let mut a = Animated::new(0.0, Spring::EMERGE);
+    /// a.launch_to(100.0, Spring::EMERGE, 1.0);
+    /// a.step(1.0 / 60.0);
+    /// assert!(a.value > 15.0, "a launched value covers a fifth of the way in one frame");
+    /// ```
+    pub fn launch_to(&mut self, target: f32, spring: Spring, launch: f32) {
+        let speed = (target - self.value) * spring.angular_frequency() * launch.max(0.0);
+        let faster = self.velocity * speed > 0.0 && self.velocity.abs() > speed.abs();
+        if !faster {
+            self.velocity = speed;
+        }
+        self.animate_to(target, spring);
     }
 
     /// Jumps to `value` with no animation.
@@ -311,6 +351,43 @@ mod tests {
         a.animate_to(2.0, Spring::SNAPPY);
         assert!(!a.step(f32::NAN));
         assert_eq!(a.value, 2.0, "a NaN step lands on the target");
+    }
+
+    #[test]
+    fn launched_smooth_spring_is_a_pure_exponential() {
+        // iOS 27 measurement: progress 0.50 after 50 ms, 0.77 after 100 ms, 0.91 after 150 ms.
+        let mut a = Animated::new(0.0, Spring::EMERGE);
+        a.launch_to(1.0, Spring::EMERGE, 1.0);
+        let w0 = Spring::EMERGE.angular_frequency();
+        for frame in 1..=30 {
+            a.step(1.0 / 120.0);
+            let expected = 1.0 - (-w0 * frame as f32 / 120.0).exp();
+            assert!((a.value - expected).abs() < 1e-4, "frame {frame}: {} vs {expected}", a.value);
+        }
+    }
+
+    #[test]
+    fn launched_spring_never_overshoots() {
+        for spring in [Spring::EMERGE, Spring::RECEDE, Spring::KNOB_SETTLE] {
+            let mut a = Animated::new(0.0, spring);
+            a.launch_to(1.0, spring, 1.0);
+            let peak = (0..600).map(|_| (a.step(1.0 / 120.0), a.value).1).fold(0.0, f32::max);
+            assert!(peak <= 1.0 + 1e-4, "{spring:?} peaked at {peak}");
+        }
+    }
+
+    #[test]
+    fn launch_keeps_a_faster_flick() {
+        let mut a = Animated { value: 0.0, velocity: 500.0, target: 0.0, spring: Spring::EMERGE };
+        a.launch_to(10.0, Spring::EMERGE, 1.0);
+        assert_eq!(a.velocity, 500.0);
+    }
+
+    #[test]
+    fn launch_reverses_at_once() {
+        let mut a = Animated { value: 50.0, velocity: 300.0, target: 100.0, spring: Spring::EMERGE };
+        a.launch_to(0.0, Spring::RECEDE, 1.0);
+        assert!(a.velocity < 0.0);
     }
 
     #[test]
