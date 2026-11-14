@@ -739,7 +739,10 @@ impl Scene {
 
     pub(crate) fn geometry(&self, node: &Node) -> Geometry {
         let size = Vec2::new(node.w.value.max(0.0), node.h.value.max(0.0));
-        let grow = if self.still() { 0.0 } else { (10.0 / size.min_element().max(1.0)).min(0.15) };
+        // Apple: a pressed control grows by 10 pt or 15 %, whichever is less. Measured on the
+        // longer side, so a wide toolbar capsule grows by 10 pt, not by 15 % of its width
+        // (which used to swallow the gap to its neighbour).
+        let grow = if self.still() { 0.0 } else { (10.0 / size.max_element().max(1.0)).min(0.15) };
         let scale = 1.0 + node.press.value * grow + node.lift.value * LENS_LIFT;
         let half = size * 0.5 * scale;
         let budget = half.min_element();
@@ -777,6 +780,17 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn a_wide_control_grows_by_ten_points_when_pressed() {
+        let mut scene = Scene::new();
+        let bar = scene.add(Glass::new(Rect::new(0.0, 0.0, 200.0, 40.0)).interactive());
+        settle(&mut scene);
+        scene.pointer_down(Vec2::new(100.0, 20.0));
+        settle(&mut scene);
+        let width = scene.geometry(&scene.nodes[bar]).half.x * 2.0;
+        assert!((width - 210.0).abs() < 0.5, "pressed width {width}, Apple: +10 pt");
     }
 
     #[test]

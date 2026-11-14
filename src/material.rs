@@ -133,6 +133,10 @@ pub struct Material {
     pub tint: Option<Color>,
     /// Localised dimming of the backdrop, `0..=1` (Apple: 0.35 for Clear over bright media).
     pub dim: f32,
+    /// Vibrancy: saturation of the backdrop seen through the glass, like CSS `saturate()`.
+    /// `1` leaves it unchanged (every preset); Apple's regular glass on the web reads as
+    /// about `1.6`, which makes colour behind the glass glow instead of washing out.
+    pub saturation: f32,
 }
 
 impl Material {
@@ -155,6 +159,7 @@ impl Material {
             adaptive: true,
             tint: None,
             dim: 0.0,
+            saturation: 1.0,
         }
     }
 
@@ -179,6 +184,7 @@ impl Material {
             adaptive: false,
             tint: None,
             dim: 0.0,
+            saturation: 1.0,
         }
     }
 
@@ -221,6 +227,7 @@ impl Material {
             adaptive: false,
             tint: None,
             dim: 0.0,
+            saturation: 1.0,
         }
     }
 
@@ -275,6 +282,7 @@ impl Material {
             adaptive: if t < 0.5 { self.adaptive } else { to.adaptive },
             tint,
             dim: f(self.dim, to.dim),
+            saturation: f(self.saturation, to.saturation),
         }
     }
 }

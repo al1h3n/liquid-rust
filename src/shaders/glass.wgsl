@@ -34,7 +34,7 @@ struct Material {
     optics: vec4f,      // refraction, light/dark adaptivity, dispersion, frost sigma (px)
     lighting: vec4f,    // splay, specular, rim, rim shade
     edge: vec4f,        // inner hairline, outer edge burn, contrast border, dim
-    shadow: vec4f,      // offset y (px), sigma (px), opacity, unused
+    shadow: vec4f,      // offset y (px), sigma (px), opacity, saturation (vibrancy, 1 = none)
     light_a: vec4f,     // light tone: lift, luminance, luminance mix, lighten
     light_b: vec4f,     // light tone: darken to, darken, unused, unused
     dark_a: vec4f,      // dark tone
@@ -390,8 +390,12 @@ fn fs_glass(v: Varyings) -> @location(0) vec4f {
     }
     col *= 1.0 - mat.edge.w;
 
-    // Tone mapping: light and dark faces, chosen by scheme or by the backdrop.
+    // Tone mapping: light and dark faces, chosen by scheme or by the backdrop. Vibrancy first,
+    // like CSS `saturate()` before the face is laid over it.
     var g = encode(col);
+    if mat.shadow.w != 1.0 {
+        g = clamp(mix(vec3f(luminance(g)), g, mat.shadow.w), vec3f(0.0), vec3f(1.0));
+    }
     let top = max(globals.misc.y - 1.0, 0.0);
     let bg = luminance(encode(textureSampleLevel(pyr, samp, center_uv, top).rgb));
     // Small glass (adaptivity 1) flips at a backdrop of ~0.36, biased toward light: it only

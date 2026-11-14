@@ -155,6 +155,10 @@ scene.shrink_into(menu, button, Spring::RECEDE);
 | `Material::tinted(color)` | the **one** primary action | `Glass.regular.tint()`: stained glass, never a solid fill |
 | `Material::identity()` | transition endpoint | `Glass.identity` |
 
+`Material::saturation` (since 0.3.0) adds vibrancy, like CSS `saturate()`: `1` (every
+preset) leaves the backdrop as it is; Apple's regular glass on the web reads as about `1.6`.
+A pressed control grows by 10 pt or 15 %, whichever is less, measured on its longer side.
+
 Every field maps to a knob in Figma's GLASS panel (`refraction`, `depth`, `dispersion`,
 `frost`, `splay`, `specular`) or to an Apple kit fill/shadow. You can copy values straight from a design.
 

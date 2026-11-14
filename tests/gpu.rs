@@ -426,3 +426,18 @@ fn fused_glass_keeps_each_shapes_own_tint() {
         assert!(b - r > 5.0, "tinted_first {tinted_first}: the neck shows no trace of the tint ({r}, {b})");
     }
 }
+
+#[test]
+fn saturation_makes_the_backdrop_more_vivid() {
+    // Vibrancy (CSS saturate): the same glass over a muted blue shows more colour at 1.6.
+    let backdrop = solid([90, 110, 150]);
+    let render_sat = |saturation: f32| {
+        let mut scene = Scene::new();
+        scene.add(Glass::new(Rect::new(8.0, 8.0, 112.0, 112.0)).shape(Shape::Rounded(30.0)).material(Material { saturation, ..bare() }));
+        settle(&mut scene);
+        render_at(&scene, &backdrop, 1.0).map(|frame| centre(&frame).1)
+    };
+    let Some(plain) = render_sat(1.0) else { return };
+    let vivid = render_sat(1.6).unwrap();
+    assert!(vivid > plain * 1.3, "saturation {vivid} vs {plain}");
+}
